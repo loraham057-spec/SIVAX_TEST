@@ -1,0 +1,211 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/part-of: diav1
+spec:
+  replicas: 1 # démarrage minimal ; KEDA prend le relais
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0 # never drop below the current capacity during a rollout
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        app.kubernetes.io/part-of: diav1
+      annotations:
+        # Lu par l'agent CloudWatch (Container Insights) et par tout scraper
+        # Prometheus du cluster. Ce qui est scrapé est le SIDECAR, qui a déjà
+        # fusionné les métriques OTLP de l'application avec ce qu'il collecte
+        # lui-même.
+        #
+        # Aucun label d'identité à poser, contrairement à Azure : le webhook
+        # d'EKS injecte le jeton et AWS_ROLE_ARN dès que le ServiceAccount porte
+        # l'annotation eks.amazonaws.com/role-arn.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: web
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas across nodes so losing one node cannot take the whole
+      # front end with it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: web
+      # Gives in-flight requests time to finish before the container is torn
+      # down; the container itself forwards SIGTERM through tini.
+      terminationGracePeriodSeconds: 45
+
+      containers:
+        # ─── Application ─────────────────────────────────────
+        - name: web
+          image: diav1-web:latest # replaced per environment by kustomize
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            # Telemetry goes to the sidecar over loopback.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://127.0.0.1:4318
+            - name: OTEL_SERVICE_NAME
+              value: diav1-web
+            - name: FASTAPI_URL
+              value: http://ai.diav1.svc.cluster.local:8000
+            # The sync is a CronJob; a web replica must never start a scheduler.
+            - name: ETL_SCHEDULER_ENABLED
+              value: "false"
+          envFrom:
+            - configMapRef:
+                name: app-config
+            # Recopié depuis Secrets Manager par le pilote CSI — aucune
+            # valeur n'apparaît dans un manifeste.
+            - secretRef:
+                name: diav1-secrets
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              # No CPU limit on purpose: throttling a Node.js event loop during
+              # a traffic spike is worse than letting it borrow idle CPU.
+              memory: 1Gi
+          # Liveness checks nothing external: a database blip must not restart
+          # every replica.
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness does check dependencies, so a replica that cannot serve
+          # leaves the load-balancer rotation instead of returning errors.
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24 # up to 2 minutes to start
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: next-cache
+              mountPath: /app/.next/cache
+
+        # ─── Monitoring sidecar ──────────────────────────────
+        # Reçoit l'OTLP de l'application sur la boucle locale, l'enrichit de
+        # l'identité du pod, puis pousse les traces vers X-Ray et les journaux
+        # vers CloudWatch, tout en exposant les métriques fusionnées à scraper.
+        - name: otel-sidecar
+          image: otel/opentelemetry-collector-contrib:0.115.1
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/config.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: diav1-web
+            - name: APP_METRICS_PORT
+              value: "3000"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          envFrom:
+            - configMapRef:
+                name: app-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 192Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: otel-config
+              mountPath: /conf
+              readOnly: true
+          # Outlive the app container briefly so its final spans are flushed
+          # rather than lost with the pod.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 15"]
+
+      volumes:
+        - name: otel-config
+          configMap:
+            name: otel-sidecar-config
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: diav1-secrets
+        - name: tmp
+          emptyDir: {}
+        - name: next-cache
+          emptyDir: {}

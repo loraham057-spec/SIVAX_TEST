@@ -1,0 +1,17 @@
+{
+  "buildId": "1792091290309",
+  "timestamp": "2026-10-15T19:08:10.309Z",
+  "commit": "2382623",
+  "changelog": [
+    "deploy(dev): image sha-40a3c90",
+    "fix(ci): kustomize epingle par release + sha256 au lieu du script d'install",
+    "deploy(dev): image sha-6bf5be1",
+    "docs: documents de reference PEV (livrables/doc_sante)",
+    "feat(dashboard): ajustements filtres DHIS2, pages Cibles/Surveillance et Notifications",
+    "feat(eval): auto-correction etendue, diagnostic et resolution geo/metrique plus robustes",
+    "deploy(dev): image sha-d34054b",
+    "feat(eval): pipeline d'evaluation de l'assistant (questions, verite terrain, diagnostic, auto-correction)",
+    "feat(notifications): fusion de l'onglet Alertes dans le flux Notifications",
+    "deploy(dev): image sha-e10a2d9"
+  ]
+}

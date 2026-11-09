@@ -1,0 +1,173 @@
+# k8s — deploy (EKS)
+#
+# BRANCH = ENVIRONMENT. A build of `dev` deploys dev; a build of `prod` deploys
+# prod. Nothing else has to be selected: the branch that was built is the branch
+# that gets its image tag moved, and each cluster's Flux tracks exactly one
+# branch (gitops_branch in the Terraform env), so the tag bump lands only on the
+# cluster that branch belongs to.
+#
+# PROMOTION AUTOMATIQUE. Un rollout dev réussi enchaîne sur le stage
+# `promote_prod`, qui merge le commit dev déployé dans `prod` et le pousse. Ce
+# push relance app-build sur prod, qui reboucle sur ce pipeline pour le rollout
+# prod. dev valide, prod suit tout seul — la seule barrière restante est
+# l'approbation de l'environnement `prod` (si elle est encore configurée).
+#
+# The model is the one the manifests describe: deploy = git push. The rollout
+# itself is a one-line change to the tracked overlay — the image tag — which
+# Flux reconciles into the cluster. This pipeline does not `kubectl apply` the
+# application; it moves the tag and lets GitOps carry it, so the cluster and the
+# repository never disagree.
+#
+# Order matters: migrations run BEFORE the new image is rolled out, so the
+# schema is never behind the code that expects it. The migration is the one
+# imperative step — a Job pinned to the new image, run while the previous
+# version is still serving. Only once it succeeds is the tag moved.
+#
+# EKS n'a pas d'equivalent d'`az aks command invoke` : l'agent parle
+# directement au serveur d'API apres `aws eks update-kubeconfig`. Le principal
+# du variable group doit donc avoir, sur le cluster :
+#   · une entree d'acces EKS (aws_eks_access_entry, posee par Terraform pour
+#     `deployer_principal_arn`) avec la politique AmazonEKSClusterAdminPolicy ;
+#   · et une plage autorisee dans `eks_api_allowed_cidrs` si le point de
+#     terminaison public est restreint.
+#
+# `workflow_run` becomes a pipeline resource trigger. One difference worth
+# knowing: a pipeline-resource trigger runs THIS pipeline from its own default
+# branch, not from the branch that was built — which is why the environment is
+# read from `resources.pipeline.build.sourceBranch` in a stage condition rather
+# than from Build.SourceBranch at compile time.
+
+parameters:
+  - name: environment
+    displayName: Target environment (auto = follow the branch that was built)
+    type: string
+    default: auto
+    values: [auto, dev, prod]
+  - name: imageTag
+    displayName: Image tag to deploy (sha-xxxxxxx), blank = the built commit
+    type: string
+    default: ""
+
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: build
+      source: app-build # the name the App — build pipeline is registered under
+      trigger:
+        branches:
+          include:
+            - dev
+            - prod
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - template: ../templates/stage-k8s-deploy.yml
+    parameters:
+      environment: dev
+      requestedEnvironment: ${{ parameters.environment }}
+      imageTag: ${{ parameters.imageTag }}
+
+  - template: ../templates/stage-k8s-deploy.yml
+    parameters:
+      environment: prod
+      requestedEnvironment: ${{ parameters.environment }}
+      imageTag: ${{ parameters.imageTag }}
+
+  # ─── Auto-promotion dev → prod ───────────────────────────
+  #
+  # Dès que le rollout dev réussit, le commit exact qui vient d'être déployé sur
+  # dev est mergé dans `prod` et poussé. Ce push (du vrai code hors infra/)
+  # redéclenche `app-build` sur prod, qui enchaîne sur ce même pipeline pour le
+  # rollout prod. On ne redéploie donc pas ici : on avance la branche, la chaîne
+  # normale prod fait le reste — build de l'image prod, migrations, tag, Flux.
+  #
+  # Pas de boucle : le commit de merge porte du code, mais le commit de tag posé
+  # ensuite par deploy_prod ne touche que infra/k8s/overlays/prod, exclu du
+  # filtre de chemins d'app-build.
+  #
+  # Ne s'exécute QUE pour un build de dev (la condition sur sourceBranch), et
+  # seulement si deploy_dev a réussi — un build de prod laisse deploy_dev à
+  # l'état "Skipped", que succeeded() ne considère pas comme un succès.
+  #
+  # En mode ACA (ORCHESTRATOR=aca), deploy_dev est skippé (le rollout AKS n'a
+  # pas lieu), mais la promotion git dev → prod reste nécessaire : c'est juste
+  # un merge + push, indépendant de l'orchestrateur. On accepte donc aussi le
+  # cas où deploy_dev a été skippé ET l'orchestrateur est ACA.
+  - stage: promote_prod
+    displayName: "Promote dev → prod"
+    dependsOn: deploy_dev
+    condition: >-
+      and(
+        or(
+          succeeded('deploy_dev'),
+          and(
+            eq(variables['ORCHESTRATOR'], 'aca'),
+            ne(variables['resources.pipeline.build.sourceBranch'], 'refs/heads/prod')
+          )
+        ),
+        eq(variables['resources.pipeline.build.sourceBranch'], 'refs/heads/dev')
+      )
+    jobs:
+      - job: promote
+        displayName: "Merge dev → prod"
+        pool:
+          vmImage: ubuntu-latest
+        variables:
+          - group: diav1-dev-aws
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            persistCredentials: true
+
+          - script: |
+              set -euo pipefail
+
+              # La promotion git dev → prod est indépendante de l'orchestrateur
+              # (AKS ou ACA). C'est un merge + push de code, pas un déploiement
+              # kubectl. On la fait dans tous les cas : en mode ACA, le
+              # déploiement réel sera pris en charge par le pipeline Container
+              # Apps qui s'exécutera après le build prod.
+
+              commit="${SOURCE_COMMIT:-}"
+              case "$commit" in
+                [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) : ;;
+                *)
+                  echo "##vso[task.logissue type=error]Commit source dev introuvable ; promotion annulée."
+                  exit 1
+                  ;;
+              esac
+
+              git config user.name  "azure-pipelines[bot]"
+              git config user.email "azure-pipelines[bot]@users.noreply.github.com"
+
+              git fetch origin dev prod
+              git checkout -B prod origin/prod
+
+              # Merge du commit dev EXACT qui vient d'être validé et déployé — pas
+              # forcément la pointe de dev si un autre push est arrivé entre-temps.
+              # --no-ff garde une trace explicite de la promotion dans l'historique.
+              git merge --no-ff "$commit" \
+                -m "promote(dev→prod): auto-migration après déploiement dev réussi ($commit)"
+
+              # Rien de neuf à pousser (prod contenait déjà ce code) : on s'arrête,
+              # la branche prod tourne déjà la même chose.
+              if git diff --quiet "origin/prod" HEAD; then
+                echo "prod contient déjà ce commit — aucune promotion nécessaire."
+                exit 0
+              fi
+
+              # Push via le PAT GitHub (le repo est sur GitHub), comme le fait le
+              # commit de tag de deploy_*.
+              remote=$(git remote get-url origin)
+              remote="${remote#https://}"
+              remote="${remote#*@}"
+              git push "https://x-access-token:${GITHUB_TOKEN}@${remote}" "HEAD:prod"
+              echo "dev promu sur prod ; app-build prod va démarrer."
+            displayName: "Merge dev into prod and push"
+            env:
+              GITHUB_TOKEN: $(GITHUB_TOKEN)
+              SOURCE_COMMIT: $(resources.pipeline.build.sourceCommit)

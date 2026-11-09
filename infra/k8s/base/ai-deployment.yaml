@@ -1,0 +1,188 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: ai
+    app.kubernetes.io/part-of: diav1
+spec:
+  # Never zero: a cold start of a Python runtime loading LangGraph is measured
+  # in tens of seconds, which is unacceptable for a conversational assistant.
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ai
+        app.kubernetes.io/part-of: diav1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: ai
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ai
+      # Longer than the web tier: an agent turn can be waiting on an LLM round
+      # trip, and cutting it off mid-answer is a visible failure to the user.
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        # ─── Application ─────────────────────────────────────
+        - name: ai
+          image: diav1-ai:latest # replaced per environment by kustomize
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: UVICORN_WORKERS
+              value: "2"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://127.0.0.1:4318
+            - name: OTEL_SERVICE_NAME
+              value: diav1-ai
+            # The ETL runs as a CronJob. In-process scheduling would make every
+            # replica sync in parallel and multiply the load on SNIS RDC.
+            - name: ETL_SCHEDULER_ENABLED
+              value: "false"
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: diav1-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36 # Python + LangGraph import is slow
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+        # ─── Monitoring sidecar ──────────────────────────────
+        # Carries the telemetry that matters most on this service: per-node LLM
+        # latency, token counts and cost, tool calls, and the DHIS2 request
+        # count per question — the numbers the performance budgets are written
+        # against. None of it is visible to a node-level agent.
+        - name: otel-sidecar
+          image: otel/opentelemetry-collector-contrib:0.115.1
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/config.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: diav1-ai
+            - name: APP_METRICS_PORT
+              value: "8000"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          envFrom:
+            - configMapRef:
+                name: app-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 192Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: otel-config
+              mountPath: /conf
+              readOnly: true
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 20"]
+
+      volumes:
+        - name: otel-config
+          configMap:
+            name: otel-sidecar-config
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: diav1-secrets
+        - name: tmp
+          emptyDir: {}

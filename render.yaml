@@ -1,0 +1,35 @@
+# Render Blueprint — FastAPI backend deployment
+# Docs: https://render.com/docs/blueprint-spec
+# After pushing, connect your repo on render.com and Render will detect this file.
+
+services:
+  - type: web
+    name: tbi-pfizer-backend
+    runtime: python
+    rootDir: backend
+    plan: starter  # starter = $7/mo, no sleep; change to "free" for testing
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false  # set manually on Render dashboard
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-6-luna
+      - key: DHIS2_BASE_URL
+        value: https://snisrdc.com
+      - key: DHIS2_USERNAME
+        sync: false
+      - key: DHIS2_PASSWORD
+        sync: false
+      - key: DHIS2_ROOT_OU
+        value: ymGeqzoPhN3
+      - key: CORS_FRONTEND_URL
+        sync: false  # set to your Vercel domain (https://yourdomain.com)
+    autoDeploy: true

@@ -1,0 +1,48 @@
+# Checkov configuration — IaC security scanning in CI.
+#
+# The scan runs against the PLAN rather than the source, so it sees resolved
+# values and catches misconfigurations introduced through a tfvars file, not
+# just through the module code.
+#
+# High and critical findings fail the build. Every skip below is a deliberate
+# exception with a stated reason — an unexplained skip is how a scanner stops
+# meaning anything.
+
+framework:
+  - terraform
+  - terraform_plan
+  - dockerfile
+  - github_actions
+
+directory:
+  - infra
+  - .
+
+skip-path:
+  - .terraform
+  - node_modules
+  - livrables
+
+skip-check:
+  # Key Vault network ACLs: flagged because the default action is Deny with an
+  # AzureServices bypass. That bypass is required for diagnostic settings; the
+  # vault itself has public_network_access_enabled = false and is only reachable
+  # through its private endpoint.
+  - CKV_AZURE_109
+
+  # Storage account public access: the assets container is intentionally
+  # reachable by Front Door, which is the whole point of moving the GeoJSON and
+  # the images off the application container. Contents are static, public
+  # artefacts — no health data.
+  - CKV_AZURE_59
+
+  # Customer-managed keys: platform-managed keys are the documented choice for
+  # aggregated (non-personal) health data. Revisit if drill-down to facility
+  # level is enabled — see the sovereignty section of improve.md.
+  - CKV_AZURE_146
+  - CKV2_AZURE_1
+
+soft-fail: false
+
+compact: true
+quiet: true

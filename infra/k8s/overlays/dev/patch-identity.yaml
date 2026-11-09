@@ -1,0 +1,37 @@
+# Rôles IRSA portés par les ServiceAccount.
+#
+# Aucune valeur réelle ne vit dans git : Flux substitue ${web_role_arn},
+# ${ai_role_arn} et ${jobs_role_arn} depuis Terraform au moment de la
+# réconciliation (map `substitutions` du module stack). L'ARN posé sur chaque
+# ServiceAccount est celui du rôle dont la politique de confiance nomme CE
+# ServiceAccount — les deux moitiés viennent du même module, elles ne peuvent
+# donc pas diverger.
+#
+# Il n'y a plus de patch de SecretProviderClass ici, contrairement à la version
+# Azure : le fournisseur AWS n'a pas besoin qu'on lui nomme une identité, il
+# utilise celle du pod qui monte le volume. Le préfixe des secrets et la région
+# sont substitués directement dans la classe de base.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: web
+  namespace: diav1
+  annotations:
+    eks.amazonaws.com/role-arn: "${web_role_arn}"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai
+  namespace: diav1
+  annotations:
+    eks.amazonaws.com/role-arn: "${ai_role_arn}"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jobs
+  namespace: diav1
+  annotations:
+    eks.amazonaws.com/role-arn: "${jobs_role_arn}"

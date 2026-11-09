@@ -1,0 +1,184 @@
+# App — build    
+#
+# Lint, typecheck and performance budgets first, then build, scan and sign the
+# two images. An image that fails the Trivy scan never reaches the registry.
+#
+# Branch = environment. `dev` builds and ships to the dev registry, `prod` to
+# the prod one; the deploy pipeline then moves the tag on that same branch and
+# Flux, which tracks one branch per cluster, reconciles it. A pull request
+# builds to verify and publishes nothing.
+#
+# Two translation notes:
+#  · Azure DevOps path filters do not accept wildcards, so `**.md` becomes the
+#    handful of markdown files that actually live at the root.
+#  · Deployment jobs cannot use `strategy: matrix`, and a deployment job is what
+#    carries the `prod` environment approval — so the images matrix becomes a
+#    compile-time loop emitting one job per image.
+
+parameters:
+  - name: images
+    type: object
+    default:
+      - name: web
+        repoVariable: ECR_REPO_WEB
+        context: .
+        dockerfile: Dockerfile
+      - name: ai
+        repoVariable: ECR_REPO_AI
+        # Contexte = racine : l'image embarque supabase/migrations, hors de backend/.
+        context: .
+        dockerfile: backend/Dockerfile
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - dev
+      - prod
+  paths:
+    exclude:
+      - infra # includes infra/k8s — manifest / tag-bump changes redeploy, they do not rebuild
+      - livrables
+      - .azuredevops
+      - .github
+      - README.md
+      - documentation.md
+      - improve.md
+
+pr:
+  branches:
+    include: ["*"]
+  paths:
+    exclude:
+      - infra
+      - livrables
+      - .azuredevops
+      - .github
+      - README.md
+      - documentation.md
+      - improve.md
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Le variable group porte les coordonnees du registre ECR et les
+  # identifiants AWS ; l'environnement Azure DevOps porte l'approbation.
+  # Selectionne a la compilation, d'apres la branche.
+  # A pull request into prod resolves to the dev group — it publishes nothing,
+  # so the only effect is which Supabase URL is baked into the throwaway image.
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/prod') }}:
+      - group: diav1-prod-aws
+      - name: targetEnv
+        value: prod
+  - ${{ else }}:
+      - group: diav1-dev-aws
+      - name: targetEnv
+        value: dev
+
+  # Pull requests build to verify; only a push to a deployable branch ships.
+  - name: publish
+    value: $[ and( ne(variables['Build.Reason'], 'PullRequest'), or( eq(variables['Build.SourceBranch'], 'refs/heads/dev'), eq(variables['Build.SourceBranch'], 'refs/heads/prod') ) ) ]
+
+jobs:
+  # ─── Quality gates ───────────────────────────────────────
+  - job: checks
+    displayName: Checks
+    steps:
+      - checkout: self
+
+      - task: UseNode@1
+        displayName: Node 22
+        inputs:
+          version: "22.x"
+
+      # `cache: npm` from setup-node, spelled out.
+      - task: Cache@2
+        displayName: Cache npm
+        inputs:
+          key: 'npm | "$(Agent.OS)" | package-lock.json'
+          restoreKeys: |
+            npm | "$(Agent.OS)"
+          path: $(Pipeline.Workspace)/.npm
+
+      - script: |
+          set -euo pipefail
+          npm config set cache "$(Pipeline.Workspace)/.npm" --global
+          npm ci
+        displayName: npm ci
+
+      - script: npx tsc --noEmit
+        displayName: Typecheck
+
+      - script: npm run lint
+        displayName: Lint
+
+      # Static-asset budget: the GeoJSON regressed to 2.6 MB once already.
+      - script: npm run perf:budget
+        displayName: Performance budget — static assets
+
+      - task: UsePythonVersion@0
+        displayName: Python 3.12
+        inputs:
+          versionSpec: "3.12"
+
+      - script: python -m compileall -q app
+        displayName: Python syntax check
+        workingDirectory: backend
+
+      # `compileall` ne prouve que la syntaxe. Installer réellement
+      # requirements.txt est ce qui vérifie que les versions épinglées résolvent
+      # ensemble — c'est le contrôle qui manquait quand fastapi a dû monter de
+      # 0.115 à 0.141 pour laisser passer starlette corrigé — et les tests
+      # attrapent les ruptures d'API que le scan d'image ne verra jamais.
+      #
+      # Bloquant. Les deux défauts préexistants qui justifiaient le sursis sont
+      # corrigés : decision_assistant.py définit désormais CHALLENGE_INTENT et
+      # CHALLENGE_PATTERNS (le chemin ne lève plus de NameError), et
+      # test_question_catalog attend 15 entrées — le compte réel du catalogue.
+      # Un échec de test arrête donc à nouveau la publication, comme il se doit.
+      - script: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -r requirements.txt pytest
+          python -m pip check
+          python -m pytest tests -q
+        displayName: Backend — dependency resolution and tests
+        workingDirectory: backend
+
+  # ─── Images ──────────────────────────────────────────────
+  - ${{ each image in parameters.images }}:
+      # On prod the deployment job binds the `prod` environment, whose approval
+      # check is the required-reviewer gate the GitHub environment provided.
+      - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/prod') }}:
+          - deployment: image_${{ image.name }}
+            displayName: "Image — ${{ image.name }} (prod)"
+            dependsOn: checks
+            environment: prod
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    # Deployment jobs do not check out by default.
+                    - checkout: self
+                    - template: ../templates/steps-build-image.yml
+                      parameters:
+                        name: ${{ image.name }}
+                        repoVariable: ${{ image.repoVariable }}
+                        context: ${{ image.context }}
+                        dockerfile: ${{ image.dockerfile }}
+
+      - ${{ else }}:
+          - job: image_${{ image.name }}
+            displayName: "Image — ${{ image.name }}"
+            dependsOn: checks
+            # fail-fast: false — one image failing must not cancel the other.
+            condition: succeeded()
+            steps:
+              - checkout: self
+              - template: ../templates/steps-build-image.yml
+                parameters:
+                  name: ${{ image.name }}
+                  repoVariable: ${{ image.repoVariable }}
+                  context: ${{ image.context }}
+                  dockerfile: ${{ image.dockerfile }}

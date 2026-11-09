@@ -1,0 +1,27 @@
+# Configuration gitleaks du dépôt.
+#
+# Reprend l'intégralité des règles par défaut ; n'ajoute qu'une exception, et
+# une seule.
+#
+# `.env.example` est un gabarit : chaque clé y est présente avec une valeur
+# VIDE, et les seules valeurs renseignées sont publiques (l'URL du SNIS, et
+# `DHIS2_ROOT_OU`, un identifiant d'unité d'organisation DHIS2 qui figure déjà
+# en clair dans infra/envs/*/terraform.tfvars).
+#
+# La règle generic-api-key se déclenche pourtant dessus : `DHIS2_PASSWORD=`
+# étant vide, le motif déborde sur la ligne suivante et prend l'identifiant
+# d'unité d'organisation pour la valeur du mot de passe. Le job secrets-scan
+# échouait donc sur toutes les pull requests, sur une valeur qui n'est pas un
+# secret.
+#
+# L'exception porte sur ce seul fichier ; tout le reste du dépôt, historique
+# compris, continue d'être analysé avec les règles complètes.
+
+title = "diav1"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Gabarit d'environnement — clés sans valeur, et valeurs publiques uniquement"
+paths = ['''^\.env\.example$''']

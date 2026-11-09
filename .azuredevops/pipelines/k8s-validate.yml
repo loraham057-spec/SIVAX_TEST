@@ -1,0 +1,111 @@
+# k8s — validate    
+#
+# The Kubernetes analogue of iac-plan: the gate that stands in front of a merge
+# touching k8s/. Flux applies whatever is on the tracked branch, continuously
+# and without a review step of its own — so a manifest that does not build, or
+# that references a field the API server would reject, must be stopped here, in
+# the pull request, rather than discovered as a silent reconciliation failure in
+# the cluster.
+#
+# Three things are checked, cheapest first:
+#   1. every overlay renders     (kustomize build)
+#   2. no leftover placeholder   (XXXX / REPLACE_ tokens never reach main)
+#   3. every object is schema-valid for the cluster's Kubernetes version,
+#      CRDs included (kubeconform against the KEDA / CSI / Flux schemas).
+#
+# Aucun acces cloud, donc ni identifiants ni variable group — une vraie
+# matrice convient ici.
+
+trigger: none
+
+pr:
+  branches:
+    include: ["*"]
+  paths:
+    include:
+      - infra/k8s
+      - .azuredevops/pipelines/k8s-validate.yml
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Doit suivre la version du plan de controle EKS (kubernetes_version dans
+  # infra/aws/envs/<env>/main.tf).
+  KUBERNETES_VERSION: "1.31.0"
+  KUBECONFORM_VERSION: "0.6.7"
+
+jobs:
+  - job: validate
+    displayName: Validate
+    strategy:
+      # The three app overlays and the shared platform layer (ingress
+      # controller) — everything Flux reconciles.
+      #
+      # NOT named `path`. Azure Pipelines exports every variable — matrix legs
+      # included — into the task's environment, uppercased. A leg named `path`
+      # therefore becomes PATH=overlays/dev, wiping the agent's real PATH, and
+      # the very next script step dies with "Unable to locate executable file:
+      # 'bash'" on a perfectly healthy ubuntu agent (run #20260818.1, all four
+      # legs). GitHub Actions has no such collision — matrix values there are
+      # only ever read through ${{ matrix.* }} — which is how the name survived
+      # the translation.
+      matrix:
+        dev:
+          overlayPath: overlays/dev
+        prod:
+          overlayPath: overlays/prod
+        platform:
+          overlayPath: platform
+        platform-issuers:
+          overlayPath: platform-issuers
+      maxParallel: 4
+    steps:
+      - checkout: self
+
+      - script: |
+          set -euo pipefail
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v$(KUBECONFORM_VERSION)/kubeconform-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kustomize version
+          kubeconform -v
+        displayName: Install kustomize and kubeconform
+
+      - script: |
+          set -euo pipefail
+          kustomize build "infra/k8s/$(overlayPath)" > rendered.yaml
+          wc -l rendered.yaml
+        displayName: Build
+
+      # Bootstrap placeholders (the ACR suffix, workload-identity client ids,
+      # the Key Vault name) are filled once from `terraform output` after the
+      # first apply and committed, because Flux reconciles what is on the
+      # branch. Until then the overlays are templates, so this is a warning, not
+      # a failure — but a placeholder must never reach a cluster: Flux would
+      # ship a manifest that cannot pull its image or exchange a token.
+      - script: |
+          set -euo pipefail
+          if grep -nE 'XXXX|REPLACE_|REPLACE\.' rendered.yaml; then
+            echo "##vso[task.logissue type=warning]Unresolved placeholder in the rendered infra/k8s/$(overlayPath) — fill it from 'terraform output' before this branch is reconciled to a cluster."
+          fi
+        displayName: Warn on unresolved placeholders
+
+      # Schemas: the Kubernetes built-ins for the exact control-plane version,
+      # plus the CRDs this platform installs (KEDA ScaledObject, the Secrets
+      # Store SecretProviderClass, …) resolved from the community catalog.
+      # -ignore-missing-schemas keeps a not-yet-catalogued CRD from failing the
+      # run, while every core object is still checked strictly.
+      - script: |
+          set -euo pipefail
+          kubeconform \
+            -strict \
+            -summary \
+            -verbose \
+            -kubernetes-version "$(KUBERNETES_VERSION)" \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -ignore-missing-schemas \
+            rendered.yaml
+        displayName: Schema validation

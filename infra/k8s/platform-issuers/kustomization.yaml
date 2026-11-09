@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Chemin séparé, et c'est délibéré.
+#
+# Flux valide tout le contenu d'une Kustomization en dry-run côté serveur avant
+# d'en appliquer la moindre ligne. Un ClusterIssuer placé à côté du HelmRelease
+# cert-manager fait donc échouer le lot entier — le type n'existe pas encore,
+# puisque c'est précisément ce HelmRelease qui l'apporte. Le lot est rejeté, la
+# release n'est jamais installée, et aucune réconciliation ultérieure ne débloque
+# la situation : elle échoue exactement de la même façon.
+#
+# Les émetteurs vivent donc dans leur propre Kustomization, déclarée dans
+# Terraform avec depends_on = ["platform"], qui n'est appliquée qu'une fois la
+# plateforme saine.
+
+resources:
+  - cluster-issuer.yaml
+  - acme-solver-networkpolicy.yaml

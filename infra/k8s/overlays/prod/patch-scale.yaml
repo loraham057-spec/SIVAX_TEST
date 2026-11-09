@@ -1,0 +1,8 @@
+# Production keeps a floor of 2 on the web tier so a single node failure never
+# leaves the front end at zero, and gives both tiers room to absorb a spike.
+- op: replace
+  path: /spec/minReplicaCount
+  value: 1
+- op: replace
+  path: /spec/maxReplicaCount
+  value: 3 # plafonné pour tenir sur 2 nœuds B2ms

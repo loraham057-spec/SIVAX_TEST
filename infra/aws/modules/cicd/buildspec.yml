@@ -1,0 +1,157 @@
+# Chaîne de livraison de diav1, exécutée par CodeBuild.
+#
+# Ordre significatif : les barrières de qualité passent AVANT la construction,
+# et la construction avant le déplacement du tag. Une image qui échoue au scan
+# n'atteint jamais le registre ; un tag n'est déplacé que sur une image qui
+# existe.
+#
+# Le déploiement lui-même est le dernier commit : Flux réconcilie la branche.
+# Le pipeline n'a donc aucun accès au cluster, et une panne du pipeline ne peut
+# pas laisser le cluster dans un état que git ignore.
+
+version: 0.2
+
+env:
+  variables:
+    TRIVY_VERSION: "0.74.0"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+      python: 3.12
+    commands:
+      - echo "Environnement ${ENV_NAME}, branche ${BRANCH}"
+
+  pre_build:
+    commands:
+      # Le tag porte le commit construit : le même code donne toujours le même
+      # nom d'image, que le build vienne d'ici ou d'ailleurs.
+      - TAG="sha-$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-7)"
+      - echo "Tag ${TAG}"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${ECR_REPO_WEB%%/*}"
+
+      # ─── Barrières de qualité ───
+      #
+      # Elles tournent avant tout le reste parce que leur rôle est d'arrêter la
+      # chaîne, pas de la commenter. Le budget d'actifs statiques est ici parce
+      # que le GeoJSON a déjà régressé à 2,6 Mo une fois sans que personne ne
+      # le voie.
+      - npm ci
+      - npx tsc --noEmit
+      - npm run lint
+      - npm run perf:budget
+      - cd backend
+      - python -m pip install --quiet --upgrade pip
+      - python -m pip install --quiet -r requirements.txt pytest
+      # `pip check` prouve que les versions épinglées résolvent ENSEMBLE — ce
+      # que `compileall` ne dit pas, et c'est ce contrôle qui manquait quand
+      # fastapi a dû monter pour laisser passer un starlette corrigé.
+      - python -m pip check
+      - python -m pytest tests -q
+      - cd ..
+
+  build:
+    commands:
+      - |
+        for img in web ai; do
+          case "$img" in
+            web) repo="$ECR_REPO_WEB"; dockerfile="Dockerfile" ;;
+            ai)  repo="$ECR_REPO_AI";  dockerfile="backend/Dockerfile" ;;
+          esac
+          echo "─── construction ${img} ───"
+          docker build \
+            --file "$dockerfile" \
+            --build-arg "NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL" \
+            --build-arg "NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY" \
+            --build-arg "NEXT_PUBLIC_VAPID_PUBLIC_KEY=$NEXT_PUBLIC_VAPID_PUBLIC_KEY" \
+            --build-arg "BUILD_ID=$TAG" \
+            --tag "${repo}:${TAG}" \
+            --tag "${repo}:latest" \
+            .
+        done
+
+      # Le scan porte sur l'image LOCALE, avant toute poussée : scanner après
+      # le push serait trop tard, la version vulnérable serait déjà disponible.
+      - curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | tar -xz -C /usr/local/bin trivy
+      - |
+        for repo in "$ECR_REPO_WEB" "$ECR_REPO_AI"; do
+          trivy image --format table --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "${repo}:${TAG}"
+        done
+
+  post_build:
+    commands:
+      # Une phase post_build s'exécute même après un échec des phases
+      # précédentes : sans ce garde-fou, un build dont les tests ont échoué
+      # pousserait quand même ses images et déplacerait le tag.
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" != "1" ]; then
+          echo "Une etape precedente a echoue : ni poussee, ni deploiement."
+          exit 1
+        fi
+
+      - docker push "${ECR_REPO_WEB}:${TAG}"
+      - docker push "${ECR_REPO_WEB}:latest"
+      - docker push "${ECR_REPO_AI}:${TAG}"
+      - docker push "${ECR_REPO_AI}:latest"
+
+      # ─── Déploiement : déplacer le tag, Flux le porte ───
+      - |
+        set -e
+        curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+        mv kustomize /usr/local/bin/
+
+        REPO_PATH=$(echo "$CODEBUILD_SOURCE_REPO_URL" | sed -E 's#^https?://[^/]*/##; s#\.git$##')
+        git config --global user.name  "aws-codebuild[bot]"
+        git config --global user.email "aws-codebuild[bot]@users.noreply.github.com"
+        git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+        # CodeBuild livre un dépôt détaché sur le commit construit. On repart de
+        # la POINTE de la branche : entre le déclenchement et cette ligne, un
+        # autre push a pu arriver, et écraser son travail serait pire que de
+        # déployer un tag légèrement en retard.
+        git fetch --depth=1 origin "$BRANCH"
+        git checkout -B "$BRANCH" "origin/$BRANCH"
+
+        cd "infra/k8s/overlays/${ENV_NAME}"
+
+        # `kustomize edit set image NOM:TAG` écrit newTag et SUPPRIME newName.
+        # Ce n'est pas cosmétique : newName porte ${web_image_repo}, que Flux
+        # substitue depuis Terraform. Sans lui les images se résolvent vers
+        # Docker Hub au lieu du registre du compte, et le cluster cesse de
+        # démarrer — ce dépôt a déjà été réparé à la main une fois pour cette
+        # raison exacte. On relit donc newName et on le repasse explicitement.
+        for img in web ai; do
+          name="diav1-${img}"
+          newname=$(awk -v n="$name" '
+            $1=="-" && $2=="name:" && $3==n {found=1; next}
+            found && $1=="newName:" {print $2; exit}
+            found && $1=="-" {exit}
+          ' kustomization.yaml)
+
+          if [ -z "$newname" ]; then
+            echo "newName manquant pour ${name} : refus de deplacer le tag." >&2
+            exit 1
+          fi
+
+          kustomize edit set image "${name}=${newname}:${TAG}"
+        done
+
+        # Garde-fou : ne jamais pousser un overlay qui a perdu sa référence de
+        # registre, quoi qu'ait fait kustomize.
+        for img in web ai; do
+          grep -q "newName: \${${img}_image_repo}" kustomization.yaml || {
+            echo "newName pour diav1-${img} n'a pas survecu a l'edition." >&2
+            exit 1
+          }
+        done
+
+        cd "$CODEBUILD_SRC_DIR"
+        if git diff --quiet; then
+          echo "Le tag etait deja a jour : rien a deployer."
+        else
+          git add "infra/k8s/overlays/${ENV_NAME}/kustomization.yaml"
+          git commit -m "deploy(${ENV_NAME}): image ${TAG}"
+          git push origin "HEAD:${BRANCH}"
+          echo "Tag ${TAG} pousse sur ${BRANCH} ; Flux reconcilie dans les deux minutes."
+        fi

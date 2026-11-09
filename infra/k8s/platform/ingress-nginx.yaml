@@ -1,0 +1,125 @@
+# Ingress controller — the public entry point the app's Ingress binds to.
+#
+# Installed as a platform component, separate from the application overlays: it
+# lives in its own namespace and is the same on every cluster, whereas the
+# overlays are per-environment and pinned to namespace diav1. Terraform points a
+# second Flux kustomization (path ./k8s/platform) at this directory, so the
+# controller is reconciled by the same GitOps loop as everything else — not
+# installed by hand.
+#
+# This is the community ingress-nginx chart, deliberately self-managed rather
+# than the AKS application-routing add-on: k8s/base/ingress.yaml enforces the
+# Front Door tenancy check with a raw configuration-snippet, which the managed
+# add-on refuses to honour. Snippet annotations are therefore enabled below —
+# acceptable here because this cluster serves one application and only its own
+# Ingress uses the annotation.
+---
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: HelmRepository
+metadata:
+  name: ingress-nginx
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://kubernetes.github.io/ingress-nginx
+---
+apiVersion: helm.toolkit.fluxcd.io/v2beta2
+kind: HelmRelease
+metadata:
+  name: ingress-nginx
+  namespace: flux-system
+spec:
+  interval: 10m
+  releaseName: ingress-nginx
+  targetNamespace: ingress-nginx
+  storageNamespace: ingress-nginx
+  install:
+    createNamespace: true
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  chart:
+    spec:
+      chart: ingress-nginx
+      version: "4.11.3" # controller v1.11.3 — supported on Kubernetes 1.30
+      sourceRef:
+        kind: HelmRepository
+        name: ingress-nginx
+        namespace: flux-system
+  values:
+    controller:
+      # Single replica to fit the tiny node budget (dev is a one-node cluster).
+      replicaCount: 1
+      ingressClassResource:
+        name: nginx # must match ingressClassName in k8s/base/ingress.yaml
+        enabled: true
+        default: false
+      ingressClass: nginx
+
+      # Exigé par le contrôle d'origine de k8s/base/ingress.yaml. Le fragment
+      # utilise `if`/`return`, que les contrôleurs récents placent derrière un
+      # niveau de risque — les deux interrupteurs sont donc posés pour que le
+      # manifeste fonctionne tel qu'il est écrit.
+      allowSnippetAnnotations: true
+      config:
+        annotations-risk-level: Critical
+        # Derriere un ALB, l'adresse du client arrive dans X-Forwarded-For et
+        # le schema d'origine dans X-Forwarded-Proto. Les lire est ce qui evite
+        # la BOUCLE DE REDIRECTION : sans cela nginx voit du HTTP en clair,
+        # repond 308 vers HTTPS, l'ALB rappelle en HTTP, et ainsi de suite. Le
+        # symptome est un « trop de redirections » cote navigateur, avec une
+        # application parfaitement saine derriere.
+        use-forwarded-headers: "${ingress_forwarded_headers}"
+        # Le PROXY protocol n'a de sens que devant un load balancer de niveau 4
+        # (NLB, Classic). Il reste pilote par Terraform pour que le montage
+        # precedent reste atteignable sans reecrire ce fichier.
+        use-proxy-protocol: "${ingress_use_proxy_protocol}"
+
+      # NLB public, lié aux IP élastiques que Terraform a pré-allouées :
+      # les adopter par leur identifiant d'allocation (Flux substitue la liste)
+      # est ce qui permet de câbler l'origine du CDN et le DNS dans le même
+      # apply. Le groupe de sécurité du cluster (Terraform) n'admet que la liste
+      # de préfixes CloudFront quand le CDN est actif, donc l'adresse n'est
+      # joignable par personne d'autre.
+      #
+      # PROXY protocol plutôt que externalTrafficPolicy: Local : ce dernier
+      # préserve aussi l'adresse du client, mais au prix de ne router que vers
+      # les nœuds qui portent un pod d'ingress — ce qui, sur un cluster de deux
+      # nœuds, transforme un rééquilibrage en coupure.
+      service:
+        # NodePort derriere un ALB : le Service ne demande plus de load
+        # balancer au fournisseur, c'est le groupe cible de l'ALB qui vient
+        # chercher ces deux ports sur les noeuds. Repasser a LoadBalancer rend
+        # le montage precedent (Classic ou NLB) sans toucher a ce fichier.
+        type: ${ingress_service_type}
+        externalTrafficPolicy: Cluster
+        # PORTS FIXES, et c'est ce qui permet de tout cabler en un seul apply :
+        # Terraform doit connaitre le port du groupe cible au moment ou il le
+        # cree, or un nodePort attribue par Kubernetes n'existe qu'apres.
+        nodePorts:
+          http: ${ingress_http_node_port}
+          https: ${ingress_https_node_port}
+        annotations:
+          # Ces annotations ne sont lues que si le Service redemande un load
+          # balancer au fournisseur. En NodePort elles sont inertes ; on les
+          # garde pour que la bascule reste un changement de variable.
+          service.beta.kubernetes.io/aws-load-balancer-type: ${ingress_lb_type}
+          service.beta.kubernetes.io/aws-load-balancer-eip-allocations: ${ingress_eip_allocations}
+          service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: ${ingress_proxy_protocol_annotation}
+          service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: TCP
+
+      # Scrapé par l'agent CloudWatch (Container Insights) quand il est actif.
+      metrics:
+        enabled: true
+      podAnnotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10254"
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          memory: 256Mi

@@ -1,0 +1,39 @@
+# Authentification AWS pour un job Azure Pipelines.
+#
+# Remplace la tâche AzureCLI@2 et sa service connection : côté AWS, un agent
+# hébergé s'authentifie par des identifiants portés en variables SECRÈTES du
+# variable group de l'environnement. Azure Pipelines n'expose PAS une variable
+# secrète à l'environnement d'un script automatiquement — c'est le bloc `env`
+# de chaque étape qui la fait passer, ici et nulle part ailleurs.
+#
+# Alternative sans clés longue durée, à préférer dès que l'organisation peut
+# installer une extension : l'« AWS Toolkit for Azure DevOps » fournit une
+# service connection qui assume un rôle par OIDC, et ces deux variables
+# disparaissent. La structure des pipelines ne changerait pas : seuls les
+# quelques blocs `env:` seraient remplacés par `awsCredentials:`.
+#
+# L'AWS CLI v2 est préinstallée sur les images ubuntu-latest hébergées ; aucune
+# installation n'est nécessaire.
+
+parameters:
+  - name: displayName
+    type: string
+    default: "Verifier l'identite AWS"
+
+steps:
+  - script: |
+      set -euo pipefail
+      if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+        echo "##vso[task.logissue type=error]AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY absents du variable group de cet environnement."
+        exit 1
+      fi
+      aws --version
+      # Trace d'audit : quel principal a agi, dans quel compte. Ni la clé ni le
+      # secret n'apparaissent — get-caller-identity ne renvoie que des
+      # identifiants publics.
+      aws sts get-caller-identity --output table
+    displayName: ${{ parameters.displayName }}
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_DEFAULT_REGION: $(AWS_REGION)

@@ -1,0 +1,35 @@
+# Les pods temporaires du défi ACME.
+#
+# cert-manager crée un pod solveur DANS ce namespace pour servir
+# /.well-known/acme-challenge. Sans cette règle il tombe sous le default-deny
+# ci-dessus : nginx ne l'atteint pas, répond 502, l'auto-vérification de
+# cert-manager expire et le certificat n'est jamais émis — le site continue de
+# présenter le certificat de secours d'ingress-nginx.
+#
+# La portée est étroite : uniquement les pods portant le label que cert-manager
+# pose lui-même sur ses solveurs, et uniquement en provenance du contrôleur
+# d'ingress.
+#
+# POURQUOI ICI ET PAS DANS base/ : l'overlay applique un transformateur
+# commonLabels qui réécrit AUSSI les podSelector. Placée dans la base, cette
+# règle se retrouvait à exiger app.kubernetes.io/managed-by=flux et
+# part-of=diav1 en plus du label ACME — or les pods solveurs, créés par
+# cert-manager et non par Flux, ne portent que le leur. Le sélecteur ne
+# correspondait donc à aucun pod, le solveur restait sous le default-deny,
+# nginx répondait 502 et le certificat n'était jamais émis. Cette Kustomization
+# n'a pas de transformateur : le sélecteur y reste littéral.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: acme-solver-ingress
+  namespace: diav1
+spec:
+  podSelector:
+    matchLabels:
+      acme.cert-manager.io/http01-solver: "true"
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx

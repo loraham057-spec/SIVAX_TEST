@@ -1,0 +1,24 @@
+{
+  "coverage": { "warning": 80, "target": 90 },
+  "dropout": { "warning": 10, "target": 5 },
+  "wastage": { "warning": 15, "target": 5 },
+  "stockout": { "warning": 10, "target": 5 },
+  "data_quality": { "warning": 80, "target": 90 },
+  "cold_chain": { "warning": 90, "target": 95 },
+  "supervision": { "warning": 70, "target": 90 },
+  "surveillance": { "warning": 80, "target": 90 },
+  "zones_below_threshold": { "warning": 10, "target": 0 },
+  "wastage_by_antigen": {
+    "l1bhrYUPsde": { "warning": 50, "target": 25 },
+    "uAWIVDnGPGH": { "warning": 25, "target": 10 },
+    "hqqlXMmY95c": { "warning": 10, "target": 5 },
+    "MJrLCya7qzt": { "warning": 10, "target": 5 },
+    "BCXcLiQNI8M": { "warning": 25, "target": 10 },
+    "IisI6JudbS8": { "warning": 10, "target": 5 },
+    "Hjlw6DpooIo": { "warning": 40, "target": 20 },
+    "vrTdwvAQSUc": { "warning": 40, "target": 20 },
+    "iFMn6ceqdIN": { "warning": 25, "target": 10 },
+    "RYaAzE1eqya": { "warning": 10, "target": 5 },
+    "BfoCv6bUeBk": { "warning": 5, "target": 2 }
+  }
+}

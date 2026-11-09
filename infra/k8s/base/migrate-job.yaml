@@ -1,0 +1,76 @@
+# Database migrations.
+#
+# Triggered by the CI before a rollout — never on a schedule, and never
+# reconciled by Flux on its own (the overlays exclude it), because a migration
+# is an ordered step in a deployment, not a desired steady state.
+#
+#   kubectl -n diav1 create job --from=cronjob/db-migrate migrate-$(git rev-parse --short HEAD)
+#
+# backoffLimit is 0 on purpose: a failed migration must be looked at, not
+# retried blindly against a half-migrated schema.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-migrate
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: db-migrate
+    app.kubernetes.io/part-of: diav1
+spec:
+  # Suspended: this CronJob exists only as a template for `create job --from`.
+  suspend: true
+  schedule: "0 0 31 2 *" # never — 31 February
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: db-migrate
+        spec:
+          serviceAccountName: jobs
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: migrate
+              image: diav1-ai:latest
+              command: ["python", "-m", "app.db.migrate"]
+              envFrom:
+                - configMapRef:
+                    name: app-config
+                - secretRef:
+                    name: diav1-secrets
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: secrets-store
+                  mountPath: /mnt/secrets
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: secrets-store
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: diav1-secrets
+            - name: tmp
+              emptyDir: {}

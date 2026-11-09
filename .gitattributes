@@ -1,0 +1,14 @@
+# Les fichiers binaires ne doivent JAMAIS passer par la conversion de fins de
+# ligne. Sans cette declaration, git traite un PDF comme du texte : il remplace
+# les octets 0x0A par 0x0D0A au checkout, et le fichier restitue n'est plus
+# lisible par aucun lecteur — alors que le depot, lui, ne signale rien.
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.zip   binary
+*.tar.gz binary

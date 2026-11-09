@@ -1,0 +1,91 @@
+# Autoscaling and disruption budgets.
+#
+# KEDA plays the role http scale rules play on Container Apps. The web tier
+# scales on requests per replica; the AI tier scales on CPU, because its cost
+# driver is the LLM round trip rather than request count and a request-based
+# rule would over-provision while every replica waits on the network.
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: web
+  namespace: diav1
+spec:
+  scaleTargetRef:
+    name: web
+  minReplicaCount: 2
+  maxReplicaCount: 6
+  pollingInterval: 15
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Slow to shrink: a premature scale-down during a traffic dip costs a
+          # cold start on the next spike.
+          stabilizationWindowSeconds: 300
+        scaleUp:
+          stabilizationWindowSeconds: 30
+  triggers:
+    # UN SEUL DECLENCHEUR, le CPU, et c'est une consequence de la bascule AWS.
+    #
+    # Il y avait ici un declencheur Prometheus qui comptait les requetes par
+    # seconde — la bonne metrique pour une facade web, bien meilleure que le
+    # CPU. Il interrogeait le Prometheus manage d'Azure. Sur EKS il n'y a pas
+    # de serveur Prometheus : les metriques des sidecars partent en EMF vers
+    # CloudWatch, ou KEDA ne sait pas les lire sans un scaler et des droits
+    # supplementaires.
+    #
+    # Le laisser en place n'etait pas neutre : KEDA marque TOUT le ScaledObject
+    # en TriggerError des qu'un declencheur echoue, si bien que le CPU ne
+    # scalait plus non plus. `web` ne pouvait donc plus grandir du tout —
+    # panne silencieuse, visible seulement dans l'etat de l'objet.
+    #
+    # Retour possible par un scaler CloudWatch, quand la charge le justifiera.
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "70"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ai
+  namespace: diav1
+spec:
+  scaleTargetRef:
+    name: ai
+  # Never zero — a cold LangGraph start is far too slow for a chat interface.
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 600
+  triggers:
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "70"
+---
+# Keeps a voluntary disruption (node drain, upgrade) from taking the whole
+# front end down at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+  namespace: diav1
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ai
+  namespace: diav1
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai

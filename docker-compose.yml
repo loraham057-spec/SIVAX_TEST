@@ -1,0 +1,75 @@
+# Local stack — the same two images the platform runs in Azure, plus Redis.
+#
+# The point is to exercise the real container images before pushing them, and
+# to run against a real Redis so the shared-cache code paths (which fall back to
+# in-process memory when REDIS_URL is unset) are actually covered.
+#
+#     cp .env.example .env.local && docker compose up --build
+#
+# Postgres is not included: phase 1 keeps Supabase as the database and identity
+# provider, so point the variables at your Supabase project.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ai:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env.local
+    environment:
+      REDIS_URL: redis://redis:6379
+      FRONTEND_URL: http://localhost:3000
+      # The sync belongs to a cron job, not to the service.
+      ETL_SCHEDULER_ENABLED: "false"
+      UVICORN_WORKERS: "1"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+        NEXT_PUBLIC_VAPID_PUBLIC_KEY: ${NEXT_PUBLIC_VAPID_PUBLIC_KEY}
+    env_file:
+      - .env.local
+    environment:
+      REDIS_URL: redis://redis:6379
+      FASTAPI_URL: http://ai:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - ai
+      - redis
+
+  # Runs the ETL once and exits, exactly as the Container App Job does.
+  #     docker compose run --rm etl
+  etl:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env.local
+    environment:
+      REDIS_URL: redis://redis:6379
+    command: ["python", "-m", "app.etl.cli", "--scope", "incremental"]
+    profiles: ["jobs"]
+    depends_on:
+      redis:
+        condition: service_healthy

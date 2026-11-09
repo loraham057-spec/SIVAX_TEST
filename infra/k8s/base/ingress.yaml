@@ -1,0 +1,54 @@
+# Point d'entrée public du cluster.
+#
+# ⚠️ Frontière de confiance, énoncée franchement : cet ingress a une adresse
+# publique. Deux contrôles se tiennent devant, et ils sont complémentaires —
+# aucun des deux ne suffit seul :
+#
+#   1. Le groupe de sécurité du cluster (Terraform, module runtime-eks)
+#      n'admet que la liste de préfixes managée « CloudFront origin-facing »,
+#      donc l'adresse est injoignable depuis l'internet ouvert.
+#   2. nginx vérifie l'en-tête X-Origin-Verify, que CloudFront ajoute à chaque
+#      requête vers l'origine. Sans lui, un autre client de CloudFront —
+#      n'importe quelle distribution, la liste de préfixes étant partagée par
+#      tous les comptes — atteindrait cette origine.
+#
+# Sans CDN, ${origin_verify_token} est substitué à vide : la comparaison
+# devient « en-tête absent == vide », qui passe, et l'ingress est alors joint
+# directement, comme prévu pour un environnement sans bord.
+#
+# L'alternative plus stricte — un load balancer interne exposé par un service
+# PrivateLink et un VPC origin CloudFront — n'est délibérément pas retenue :
+# elle demande un second apply pour que Terraform connaisse l'identifiant du
+# service, ce qui casse la promesse d'un seul apply. C'est le bon mouvement dès
+# que la plateforme tolère un amorçage en deux temps.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: diav1
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "25m" # envois vocaux
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    # Seules les requêtes portant le jeton d'origine sont servies. Flux
+    # substitue ${origin_verify_token} depuis Terraform (Secret cluster-secrets)
+    # au moment de la réconciliation ; $http_x_origin_verify est la variable de
+    # requête nginx, préservée à travers la substitution par une entrée
+    # passe-plat de la map (voir stack/main.tf).
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      if ($http_x_origin_verify != "${origin_verify_token}") {
+        return 403;
+      }
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  name: http

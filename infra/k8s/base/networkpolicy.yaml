@@ -1,0 +1,118 @@
+# Network policies, enforced by Cilium in the cluster data plane.
+#
+# Default-deny both directions, then open exactly what the platform needs.
+# This is what makes "the AI service is internal" a property of the network
+# rather than a convention: nothing outside the namespace can reach it, even if
+# a Service were misconfigured to expose it.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: diav1
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# The web tier accepts traffic from the ingress controller only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-ingress
+  namespace: diav1
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000
+    # Managed Prometheus scrapes the sidecar.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 9464
+---
+# The AI service accepts traffic from the web tier only — never from outside.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-ingress
+  namespace: diav1
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ai
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: web
+      ports:
+        - protocol: TCP
+          port: 8000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 9464
+---
+# Egress: DNS, plus HTTPS to the outside world.
+#
+# The external destinations (SNIS RDC, the LLM provider, Supabase, Resend) are
+# third parties whose address ranges are neither stable nor published, so
+# pinning CIDRs here would break on their next infrastructure change. The
+# egress control that actually holds is the NAT Gateway's fixed IP, which is
+# what the other side allow-lists.
+#
+# Note AWS : les appels à Secrets Manager, ECR, S3, CloudWatch et STS sortent
+# par le même chemin, sauf quand les points de terminaison de VPC sont activés
+# (enable_interface_endpoints) — ils restent alors dans le réseau AWS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress
+  namespace: diav1
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Within the namespace: web → ai, and app → sidecar.
+    - to:
+        - podSelector: {}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Block the cloud metadata endpoint: a compromised pod must not
+              # be able to ask the node for its identity.
+              - 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 443
+        # PostgreSQL and Redis reach their private endpoints inside the VNet.
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6380

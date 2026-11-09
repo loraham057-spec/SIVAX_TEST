@@ -1,0 +1,266 @@
+# Un stage de déploiement pour un environnement EKS. Appelé deux fois par
+# pipelines/k8s-deploy.yml, une fois par environnement, parce que le variable
+# group et l'environnement Azure DevOps doivent être fixés à la compilation
+# alors que la branche déclenchante n'est connue qu'à l'exécution. La condition
+# du stage est ce qui choisit le bon des deux.
+#
+# ⚠️ CE QUI CHANGE EN VENANT D'AKS. Azure offrait `az aks command invoke`, qui
+# exécute kubectl DANS le cluster — la façon d'atteindre un serveur d'API privé
+# depuis un agent hébergé. EKS n'a pas d'équivalent. Deux conséquences, toutes
+# deux assumées ici :
+#
+#   · l'agent parle directement au serveur d'API, après
+#     `aws eks update-kubeconfig` ;
+#   · le point de terminaison public du cluster doit donc rester joignable
+#     depuis l'agent. C'est le rôle de `eks_api_allowed_cidrs` côté Terraform :
+#     la liste des plages autorisées, et non « ouvert à tous ». Un agent
+#     hébergé Microsoft n'ayant pas d'IP stable, un cluster réellement privé
+#     impose un agent auto-hébergé dans le VPC — c'est le pas suivant, pas un
+#     oubli.
+#
+# Le code de sortie de kubectl est celui de l'étape : le piège du `exitCode`
+# noyé dans la réponse JSON d'`az aks command invoke`, qui faisait passer une
+# migration en échec pour un succès, disparaît avec la traduction.
+
+parameters:
+  - name: environment # dev | prod
+    type: string
+  - name: requestedEnvironment # auto | dev | prod, depuis le paramètre du pipeline
+    type: string
+  - name: imageTag # tag explicite pour un redéploiement, ou '' pour le dériver
+    type: string
+    default: ""
+
+stages:
+  - stage: deploy_${{ parameters.environment }}
+    displayName: "Deploy — ${{ parameters.environment }}"
+    # Aucune dépendance implicite au stage déclaré avant celui-ci : les deux
+    # stages d'environnement sont des alternatives, pas une chaîne de
+    # promotion. Exactement un des deux passe sa condition sur un run donné.
+    dependsOn: []
+    condition: >-
+      or(
+        eq('${{ parameters.requestedEnvironment }}', '${{ parameters.environment }}'),
+        and(
+          eq('${{ parameters.requestedEnvironment }}', 'auto'),
+          eq(variables['resources.pipeline.build.sourceBranch'], 'refs/heads/${{ parameters.environment }}')
+        )
+      )
+    jobs:
+      - deployment: deploy
+        displayName: "Rollout (${{ parameters.environment }})"
+        pool:
+          vmImage: ubuntu-latest
+        environment: ${{ parameters.environment }}
+        variables:
+          - group: diav1-${{ parameters.environment }}-aws
+          - name: TARGET_ENV
+            value: ${{ parameters.environment }}
+          # Valeurs par défaut pour que le résumé s'affiche même si une étape
+          # amont a échoué ; les étapes ci-dessous les écrasent.
+          - name: imageTag
+            value: unknown
+          - name: overlayChanged
+            value: unknown
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Le déplacement du tag est commité sur la branche déployée —
+                # celle que le Flux de ce cluster suit — donc on récupère cette
+                # branche, à sa pointe et non au commit du build.
+                - checkout: self
+                  fetchDepth: 0
+                  persistCredentials: true
+
+                - script: |
+                    set -euo pipefail
+                    git fetch origin "$(TARGET_ENV)"
+                    git checkout -B "$(TARGET_ENV)" "origin/$(TARGET_ENV)"
+                    git --no-pager log -1 --oneline
+                  displayName: "Recuperer $(TARGET_ENV) a sa pointe"
+
+                - script: |
+                    set -euo pipefail
+                    tag="${IMAGE_TAG:-}"
+                    if [ -z "$tag" ]; then
+                      # Le commit qu'app-build a construit, dont son tag est
+                      # dérivé. Repli sur la pointe de branche quand ce run
+                      # n'a pas été déclenché par un build.
+                      commit="${SOURCE_COMMIT:-}"
+                      case "$commit" in
+                        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) : ;;
+                        *) commit=$(git rev-parse HEAD) ;;
+                      esac
+                      tag="sha-${commit:0:7}"
+                    fi
+                    echo "##vso[task.setvariable variable=imageTag]${tag}"
+                    echo "Deploiement du tag : ${tag}"
+                  displayName: Resoudre le tag d'image
+                  env:
+                    IMAGE_TAG: ${{ parameters.imageTag }}
+                    SOURCE_COMMIT: $(resources.pipeline.build.sourceCommit)
+
+                - template: steps-aws-login.yml
+
+                - script: |
+                    set -euo pipefail
+                    aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_DEFAULT_REGION"
+                    kubectl version --output=json | head -20
+                    kubectl -n diav1 get deploy
+                  displayName: Se connecter au cluster
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_REGION)
+                    EKS_CLUSTER: $(EKS_CLUSTER)
+
+                # ─── Migrations, avant la nouvelle image ─────
+                #
+                # Un Job épinglé au nouveau tag, exécuté pendant que la version
+                # courante sert encore.
+                #
+                # DÉSACTIVÉE PAR DÉFAUT (RUN_DB_MIGRATIONS != true), et ce n'est
+                # pas un contournement : le schéma applicatif vit dans Supabase,
+                # pas dans le PostgreSQL que DATABASE_URL désigne. Les fichiers
+                # de supabase/migrations/ référencent le schéma `auth` et des
+                # policies RLS propres à Supabase, où ils ont été appliqués à la
+                # main (voir l'en-tête de backend/app/db/migrate.py). Les
+                # rejouer sur RDS échoue sur `schema "auth" does not exist` et
+                # bloquerait tout déploiement.
+                #
+                # Passer RUN_DB_MIGRATIONS à "true" le jour où RDS portera
+                # réellement le schéma : la machinerie et la barrière restent
+                # intactes.
+                - script: |
+                    set -euo pipefail
+                    export IMAGE="${ECR_REPO_AI}:$(imageTag)"
+                    export JOB="migrate-$(imageTag)"
+
+                    envsubst '${IMAGE} ${JOB}' \
+                      < .azuredevops/scripts/migrate-job.yaml.tpl > /tmp/migrate-job.yaml
+                    cp /tmp/migrate-job.yaml .
+                    JOB="$JOB" bash .azuredevops/scripts/wait-migrate.sh
+                  displayName: Migrations de base de donnees
+                  condition: and(succeeded(), eq(variables['RUN_DB_MIGRATIONS'], 'true'))
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_REGION)
+                    ECR_REPO_AI: $(ECR_REPO_AI)
+
+                # ─── Rollout : bouger le tag, Flux le porte ──
+                - script: |
+                    set -euo pipefail
+                    curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+                    sudo mv kustomize /usr/local/bin/
+                    kustomize version
+                  displayName: Installer kustomize
+
+                # Le tag seul, jamais le nom : le nom d'image dans l'overlay est
+                # `${web_image_repo}`, que Flux substitue depuis Terraform.
+                # L'écraser ici le remplacerait par un littéral et casserait la
+                # substitution — donc on ne déplace que le tag.
+                - script: |
+                    set -euo pipefail
+
+                    # `kustomize edit set image NAME:TAG` écrit newTag et
+                    # SUPPRIME newName. Ce n'est pas cosmétique : newName porte
+                    # ${web_image_repo}, substitué depuis les sorties Terraform.
+                    # Sans lui, les images se résolvent vers Docker Hub au lieu
+                    # du registre de l'environnement et les deux clusters
+                    # cessent de démarrer — ce dépôt a déjà été réparé à la main
+                    # une fois pour exactement cette raison (ca9e1ca).
+                    #
+                    # On relit donc le newName existant et on le repasse
+                    # explicitement sous la forme NAME=NEWNAME:TAG, qui écrit
+                    # les deux champs.
+                    for image in web ai; do
+                      name="diav1-${image}"
+                      newname=$(awk -v n="$name" '
+                        $1=="-" && $2=="name:" && $3==n {found=1; next}
+                        found && $1=="newName:" {print $2; exit}
+                        found && $1=="-" {exit}
+                      ' kustomization.yaml)
+
+                      if [ -z "$newname" ]; then
+                        echo "##vso[task.logissue type=error]newName manquant pour ${name} dans l'overlay $(TARGET_ENV) ; refus de bouger le tag."
+                        exit 1
+                      fi
+
+                      kustomize edit set image "${name}=${newname}:$(imageTag)"
+                    done
+
+                    # Garde-fou : ne jamais pousser un overlay qui a perdu sa
+                    # référence de registre, quoi qu'ait fait kustomize.
+                    for image in web ai; do
+                      if ! grep -qE "newName: \\\$\\{${image}_image_repo\\}" kustomization.yaml; then
+                        echo "##vso[task.logissue type=error]newName pour diav1-${image} n'a pas survecu a l'edition kustomize."
+                        exit 1
+                      fi
+                    done
+
+                    echo "--- images de kustomization.yaml ---"
+                    sed -n '/^images:/,/^[a-z]/p' kustomization.yaml
+                  displayName: Deplacer les tags d'image dans l'overlay
+                  workingDirectory: infra/k8s/overlays/$(TARGET_ENV)
+
+                - script: |
+                    set -euo pipefail
+                    git config user.name  "azure-pipelines[bot]"
+                    git config user.email "azure-pipelines[bot]@users.noreply.github.com"
+
+                    if git diff --quiet; then
+                      echo "Aucun changement d'overlay — le tag etait deja a jour."
+                      echo "##vso[task.setvariable variable=overlayChanged]false"
+                      exit 0
+                    fi
+
+                    git add "infra/k8s/overlays/$(TARGET_ENV)/kustomization.yaml"
+                    # PAS de [skip ci] ici. Azure DevOps ignore un push dès que
+                    # N'IMPORTE LEQUEL de ses commits porte ce marqueur — pas
+                    # seulement le dernier. Ces commits de déploiement finissent
+                    # par voyager : un merge dev -> prod les emporte, et le push
+                    # de prod se retrouve muet alors qu'il contient du vrai code.
+                    # C'est arrivé le 18/08.
+                    #
+                    # Le marqueur était de toute façon redondant : app-build
+                    # exclut infra/ de son filtre de chemins, k8s-deploy et
+                    # k8s-validate sont en trigger: none, et iac-apply exclut
+                    # infra/k8s.
+                    git commit -m "deploy($(TARGET_ENV)): image $(imageTag)"
+
+                    remote=$(git remote get-url origin)
+                    remote="${remote#https://}"
+                    remote="${remote#*@}"
+                    git pull --rebase --autostash origin "$(TARGET_ENV)"
+                    git push "https://x-access-token:${GITHUB_TOKEN}@${remote}" "HEAD:$(TARGET_ENV)"
+                    echo "##vso[task.setvariable variable=overlayChanged]true"
+                  displayName: Commiter et pousser
+                  env:
+                    GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+                - script: |
+                    set -euo pipefail
+                    TAG="$(imageTag)" bash .azuredevops/scripts/reconcile.sh
+                  displayName: Reconcilier et attendre le rollout
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_REGION)
+
+                - script: |
+                    set -euo pipefail
+                    out="$(Agent.TempDirectory)/summary.md"
+                    {
+                      echo "### Deploiement EKS — $(TARGET_ENV)"
+                      echo ""
+                      echo "| | |"
+                      echo "|--|--|"
+                      echo "| Cluster | $(EKS_CLUSTER) |"
+                      echo "| Tag d'image | $(imageTag) |"
+                      echo "| Overlay commite | $(overlayChanged) |"
+                    } > "$out"
+                    echo "##vso[task.uploadsummary]$out"
+                  displayName: Resume
+                  condition: always()

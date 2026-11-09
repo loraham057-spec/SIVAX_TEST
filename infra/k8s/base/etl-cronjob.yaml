@@ -1,0 +1,241 @@
+# The ETL is a CronJob, not a thread inside the API service.
+#
+# With an in-process scheduler every replica fires its own sync at 03:00 and
+# multiplies the load on an SNIS RDC instance that is already the reason the
+# warehouse exists. A CronJob fires exactly once regardless of replica count.
+#
+# No monitoring sidecar here on purpose: a batch job's stdout is collected by
+# the Container Insights DaemonSet, and a sidecar would keep the pod alive
+# after the job container exits, so the Job would never complete.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-incremental
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: etl
+    app.kubernetes.io/part-of: diav1
+spec:
+  # Wednesday 03:00 UTC — the low-load window on SNIS RDC. With the Sunday full
+  # sync (etl-full), data is never more than 3-4 days behind.
+  schedule: "0 3 * * 3"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid # a slow run must not overlap the next one
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: etl
+        spec:
+          serviceAccountName: jobs
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: etl
+              image: diav1-ai:latest
+              command: ["python", "-m", "app.etl.cli"]
+              args: ["--scope", "incremental"]
+              envFrom:
+                - configMapRef:
+                    name: app-config
+                - secretRef:
+                    name: diav1-secrets
+              resources:
+                requests:
+                  # 200m, pas 500m : l ETL est limite par les appels DHIS2, pas
+                  # par le CPU (les noeuds mesurent 5 a 7 % d usage reel). A
+                  # 500m le pod ne se planifiait sur aucun noeud des deux
+                  # environnements — le job restait Pending et l ETL ne tournait
+                  # jamais. Aucune limite CPU n est posee : il peut deborder.
+                  cpu: 200m
+                  memory: 1Gi
+                limits:
+                  memory: 2Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: secrets-store
+                  mountPath: /mnt/secrets
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: secrets-store
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: diav1-secrets
+            - name: tmp
+              emptyDir: {}
+---
+# Sunday sync of the 3 last complete months, including the zone level of the
+# thematic pages. DHIS2 corrects data retroactively for about 90 days; older
+# months are loaded once with `--scope history`. Weekend, when both sides are
+# quiet. (The CronJob keeps its historical name.)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-full
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: etl
+    app.kubernetes.io/part-of: diav1
+spec:
+  schedule: "0 4 * * 0"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 7200
+      ttlSecondsAfterFinished: 172800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: etl
+        spec:
+          serviceAccountName: jobs
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: etl-full
+              image: diav1-ai:latest
+              command: ["python", "-m", "app.etl.cli"]
+              args: ["--scope", "weekly"]
+              envFrom:
+                - configMapRef:
+                    name: app-config
+                - secretRef:
+                    name: diav1-secrets
+              resources:
+                requests:
+                  # 200m, pas 500m : l ETL est limite par les appels DHIS2, pas
+                  # par le CPU (les noeuds mesurent 5 a 7 % d usage reel). A
+                  # 500m le pod ne se planifiait sur aucun noeud des deux
+                  # environnements — le job restait Pending et l ETL ne tournait
+                  # jamais. Aucune limite CPU n est posee : il peut deborder.
+                  cpu: 200m
+                  memory: 1Gi
+                limits:
+                  memory: 2Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: secrets-store
+                  mountPath: /mnt/secrets
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: secrets-store
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: diav1-secrets
+            - name: tmp
+              emptyDir: {}
+---
+# Yearly aggregates and population (Cibles page), 1st of the month — they
+# change at most a few times a year. 08:00 UTC: after the Wednesday/Sunday
+# windows, which are capped at 2 h.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etl-annual
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: etl
+    app.kubernetes.io/part-of: diav1
+spec:
+  schedule: "0 8 1 * *"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 172800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: etl
+        spec:
+          serviceAccountName: jobs
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: etl-annual
+              image: diav1-ai:latest
+              command: ["python", "-m", "app.etl.cli"]
+              args: ["--scope", "annual"]
+              envFrom:
+                - configMapRef:
+                    name: app-config
+                - secretRef:
+                    name: diav1-secrets
+              resources:
+                requests:
+                  # 200m, pas 500m : l ETL est limite par les appels DHIS2, pas
+                  # par le CPU (les noeuds mesurent 5 a 7 % d usage reel). A
+                  # 500m le pod ne se planifiait sur aucun noeud des deux
+                  # environnements — le job restait Pending et l ETL ne tournait
+                  # jamais. Aucune limite CPU n est posee : il peut deborder.
+                  cpu: 200m
+                  memory: 1Gi
+                limits:
+                  memory: 2Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: secrets-store
+                  mountPath: /mnt/secrets
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: secrets-store
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: diav1-secrets
+            - name: tmp
+              emptyDir: {}

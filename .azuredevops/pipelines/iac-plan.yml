@@ -1,0 +1,148 @@
+# IaC — plan
+#
+# Tourne sur chaque pull request touchant infra/. Produit un plan, le passe aux
+# règles de sécurité, et publie le résultat dans la PR pour qu'un relecteur voie
+# ce qui changerait avant d'approuver — pas après.
+#
+# La matrice sur [dev, prod] devient une boucle à la compilation qui émet un job
+# par environnement : chacun a besoin de son propre variable group, et un groupe
+# ne peut pas être choisi depuis une variable de matrice.
+
+parameters:
+  - name: environments
+    type: object
+    default: [dev, prod]
+  - name: terraformVersion
+    type: string
+    default: "1.9.8"
+
+# Les plans sont une barrière de pull request, rien d'autre.
+trigger: none
+
+pr:
+  branches:
+    include: ["*"]
+  paths:
+    include:
+      - infra/aws
+      - .azuredevops/pipelines/iac-plan.yml
+    exclude:
+      - infra/k8s # les manifests Kubernetes sont validés par k8s-validate
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - ${{ each env in parameters.environments }}:
+      - job: plan_${{ env }}
+        displayName: "Plan — ${{ env }}"
+        variables:
+          - group: diav1-${{ env }}-aws
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps-install-terraform.yml
+            parameters:
+              version: ${{ parameters.terraformVersion }}
+
+          - template: ../templates/steps-aws-login.yml
+
+          - script: |
+              set -euo pipefail
+              terraform fmt -check -recursive ../..
+              terraform init -backend-config=backend.hcl -input=false
+              terraform validate -no-color
+
+              # -lock=false : un plan est en lecture seule, et il ne doit jamais
+              # faire la queue derrière un apply qui tient le verrou d'état.
+              terraform plan -no-color -input=false -lock=false -out=tfplan
+              terraform show -no-color tfplan > plan.txt
+              terraform show -json    tfplan > plan.json
+            displayName: "fmt, init, validate, plan"
+            workingDirectory: infra/aws/envs/${{ env }}
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(AWS_REGION)
+              TF_VAR_openai_api_key: $(OPENAI_API_KEY)
+              TF_VAR_dhis2_password: $(DHIS2_PASSWORD)
+              TF_VAR_resend_api_key: $(RESEND_API_KEY)
+              TF_VAR_elevenlabs_api_key: $(ELEVENLABS_API_KEY)
+              TF_VAR_supabase_service_role_key: $(SUPABASE_SERVICE_ROLE_KEY)
+              TF_VAR_vapid_private_key: $(VAPID_PRIVATE_KEY)
+              TF_VAR_supabase_anon_key: $(SUPABASE_ANON_KEY)
+              TF_VAR_supabase_url: $(SUPABASE_URL)
+              TF_VAR_vapid_public_key: $(VAPID_PUBLIC_KEY)
+              TF_VAR_gitops_https_token: $(GITHUB_TOKEN)
+
+          - script: |
+              set -euo pipefail
+              curl -fsSL https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip -o /tmp/tflint.zip
+              sudo unzip -o -q /tmp/tflint.zip -d /usr/local/bin
+              tflint --version
+              tflint --recursive --chdir=infra/aws
+            displayName: tflint
+            continueOnError: true
+
+          # Le scan de sécurité porte sur le PLAN, pas seulement sur la source :
+          # il voit les valeurs résolues, donc une erreur de configuration
+          # introduite par un tfvars est attrapée aussi. Pas de soft-fail — une
+          # trouvaille fait échouer la PR.
+          #
+          # CKV_AWS_338 : rétention CloudWatch d'un an. Ce dépôt fixe la
+          # rétention par variable (30 jours en dev), délibérément, pour le coût.
+          - script: |
+              set -euo pipefail
+              python -m pip install --quiet checkov
+              checkov \
+                --file infra/aws/envs/${{ env }}/plan.json \
+                --framework terraform_plan \
+                --skip-check CKV_AWS_338 \
+                --compact --quiet
+            displayName: Checkov
+
+          # Pas d'équivalent natif du commentaire `actions/github-script` :
+          # appel direct à l'API GitHub. GITHUB_TOKEN est un PAT avec
+          # `pull_request: write`, tenu en variable secrète du variable group.
+          - script: |
+              set -euo pipefail
+              plan="infra/aws/envs/${{ env }}/plan.txt"
+              body_file="$(Agent.TempDirectory)/comment-${{ env }}.md"
+
+              if [ -f "$plan" ]; then
+                # GitHub plafonne un commentaire à 65 536 caractères.
+                head -c 60000 "$plan" > /tmp/plan-trunc.txt
+                [ "$(wc -c < "$plan")" -gt 60000 ] && echo '… tronque …' >> /tmp/plan-trunc.txt
+              else
+                echo 'Plan indisponible.' > /tmp/plan-trunc.txt
+              fi
+
+              {
+                printf '### Terraform plan — `%s`\n\n<details><summary>Voir le plan</summary>\n\n```hcl\n' "${{ env }}"
+                cat /tmp/plan-trunc.txt
+                printf '\n```\n\n</details>\n'
+              } > "$body_file"
+
+              jq -Rs '{body: .}' < "$body_file" > /tmp/payload.json
+              curl -sS -f -X POST \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$(Build.Repository.Name)/issues/$(System.PullRequest.PullRequestNumber)/comments" \
+                -d @/tmp/payload.json > /dev/null
+              echo "Commentaire publie sur la PR #$(System.PullRequest.PullRequestNumber)."
+            displayName: Publier le plan sur la PR
+            condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
+            env:
+              GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+  - job: secrets_scan
+    displayName: Scan de secrets
+    steps:
+      - checkout: self
+        fetchDepth: 0 # gitleaks scanne l'historique, pas seulement la pointe
+      - script: |
+          set -euo pipefail
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks detect --source . --redact --verbose
+        displayName: gitleaks

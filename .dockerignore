@@ -1,0 +1,47 @@
+# Keeping the build context small is not cosmetic: everything here would
+# otherwise be uploaded to the daemon and end up in an image layer.
+
+.git
+.github
+.claude
+
+node_modules
+.next
+out
+build
+dist
+
+# 5 MB of Word deliverables that have no business in a runtime image.
+livrables
+
+infra
+supabase/*.js
+scripts/optimize-images.py
+scripts/simplify-geojson.mjs
+
+# Never bake credentials into an image.
+.env
+.env.*
+!.env.example
+
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+
+.vscode
+.idea
+
+README.md
+documentation.md
+improve.md
+Dockerfile
+backend/Dockerfile
+docker-compose.yml

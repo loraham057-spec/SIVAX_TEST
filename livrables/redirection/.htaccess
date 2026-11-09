@@ -1,0 +1,38 @@
+# Redirection du nom racine vers www.sivax.health
+#
+# POURQUOI CE FICHIER EXISTE. Un ALB n'a pas d'adresse IP fixe, seulement un
+# nom, et la norme DNS interdit un CNAME à l'apex d'une zone. Le nom racine ne
+# peut donc pas pointer directement sur la plateforme. C'est ce petit
+# hébergement qui répond à sa place, et qui renvoie vers le nom servi.
+#
+# Deux mécanismes se superposent volontairement dans ce dossier : cette
+# réécriture Apache, et un index.php de repli. La réécriture gagne toujours si
+# le module est actif ; le PHP prend le relais si mod_rewrite est indisponible.
+# Aucun des deux ne peut donc rester seul en panne silencieuse.
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # La condition sur l'hôte est ce qui empêche la boucle. Sans elle, une
+  # requête arrivant déjà sur www — cas d'une mauvaise configuration DNS —
+  # serait redirigée vers elle-même indéfiniment, et le navigateur afficherait
+  # « trop de redirections » au lieu du site.
+  RewriteCond %{HTTP_HOST} ^sivax\.health$ [NC]
+  RewriteRule ^(.*)$ https://www.sivax.health/$1 [R=301,L,QSA]
+
+  # Même traitement pour un éventuel autre sous-domaine servi par cet
+  # hébergement et destiné au même endroit.
+  RewriteCond %{HTTP_HOST} ^(?!www\.|dev\.)([a-z0-9-]+\.)?sivax\.health$ [NC]
+  RewriteRule ^(.*)$ https://www.sivax.health/$1 [R=301,L,QSA]
+</IfModule>
+
+# Sans mod_rewrite, tout passe par index.php, qui fait le même travail.
+<IfModule !mod_rewrite.c>
+  DirectoryIndex index.php
+  ErrorDocument 404 /index.php
+</IfModule>
+
+# Rien d'autre ne doit être servi depuis cet hébergement : il n'a qu'une
+# fonction, rediriger. Lister le contenu du dossier n'apporterait qu'une
+# surface d'exposition.
+Options -Indexes

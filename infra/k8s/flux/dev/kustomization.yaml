@@ -1,0 +1,15 @@
+# Racine de la réconciliation Flux pour dev.
+#
+# Le chart flux2-sync, posé par Terraform (infra/aws/modules/gitops), crée un
+# GitRepository « flux-system » et une Kustomization qui pointe sur ce
+# répertoire. Ce que Flux y trouve, ce sont les trois Kustomization ci-dessous
+# — c'est-à-dire l'ordre de déploiement, exprimé en git plutôt qu'en Terraform.
+#
+# Chacune substitue ses valeurs depuis le ConfigMap cluster-vars et le Secret
+# cluster-secrets, tous deux écrits par Terraform dans flux-system. C'est ce
+# qui permet aux overlays de porter `${web_role_arn}` et jamais un ARN réel :
+# rien de propre à un environnement ne vit dans le dépôt.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - kustomizations.yaml

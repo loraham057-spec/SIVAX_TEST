@@ -1,0 +1,91 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env files
+.env*.local
+.env
+
+# seed user data (contains credentials — never commit)
+supabase/users.json
+
+# Azure credentials dropped in for local runs — service principal secret,
+# API keys. NEVER commit. Secrets belong in a vault / env vars, not the repo.
+infra/azure-configs.txt
+**/azure-configs.txt
+*.credentials.json
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# python
+__pycache__/
+*.pyc
+backend/.venv/
+
+# ─── Terraform ───────────────────────────────────────────
+# Provider binaries and module caches are re-fetched by `terraform init`.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+# Un fichier de plan porte les VALEURS resolues, secrets compris : il ne doit
+# jamais etre commite, quel que soit le suffixe qu'on lui donne.
+tfplan-*
+plan.json
+plan.txt
+drift.txt
+# crash.log can contain resolved variable values.
+crash.log
+crash.*.log
+# Never commit variable files holding secrets. terraform.tfvars is committed on
+# purpose — it holds only non-secret configuration.
+*.auto.tfvars
+secrets.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Word lock files, created while a document is open.
+~$*
+
+# Environment configuration files holding live credentials. Never committed.
+# La règle ne couvrait que *.txt : les mêmes valeurs redéposées en .env — dont
+# `infra/.env`, qui porte le secret client du service principal Terraform —
+# étaient à un `git add -A` de l'historique.
+infra/*.txt
+infra/*.env
+infra/.env
+!infra/README.md
+
+# Bootstrap keeps its state locally — it creates the remote backend itself.
+infra/bootstrap/terraform/terraform.tfstate*
+infra/bootstrap/terraform/.terraform/
+infra/aws/bootstrap/terraform.tfstate*
+infra/aws/bootstrap/.terraform/
+
+# Supabase CLI temp output
+supabase/.temp/

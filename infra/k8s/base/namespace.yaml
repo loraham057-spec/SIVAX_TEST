@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: diav1
+  labels:
+    name: diav1
+    # Enforce the restricted Pod Security Standard: no privilege escalation, no
+    # host namespaces, non-root only. Every container here already complies, so
+    # this is a guard against a future manifest that would not.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

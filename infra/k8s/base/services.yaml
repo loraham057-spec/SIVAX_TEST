@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+# The AI service is reachable only from inside the cluster. Nothing routes to
+# it from the ingress: the browser always talks to the web tier, which proxies.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: ai
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ai
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

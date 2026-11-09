@@ -1,0 +1,362 @@
+# Chaîne de livraison — build, scan, déploiement.
+#
+# BRANCHE = ENVIRONNEMENT, la même règle que Flux : un push sur `dev` déploie
+# dev, un push sur `prod` déploie prod. Rien d'autre à sélectionner, et un
+# déploiement ne peut pas atteindre un environnement que la branche ne désigne
+# pas.
+#
+# ─── Aucun secret AWS dans ce dépôt ───
+#
+# L'authentification se fait par fédération OIDC : le workflow présente un jeton
+# signé par GitHub, AWS vérifie qu'il vient bien de CE dépôt et de CETTE branche
+# (condition `sub` du rôle, posée par Terraform), puis délivre des identifiants
+# temporaires. Il n'y a donc aucune clé longue durée à déposer, à faire tourner,
+# ni à révoquer quand quelqu'un quitte l'équipe.
+#
+# Les valeurs de build propres à l'environnement — dépôts ECR, URL Supabase,
+# clé publique VAPID — ne sont pas écrites ici non plus : elles sont lues dans
+# un paramètre SSM que Terraform tient à jour. Rien de ce qui dépend d'un
+# environnement ne vit dans git.
+#
+# ─── Le déploiement est un commit ───
+#
+# La dernière étape déplace le tag d'image dans l'overlay et pousse. Flux
+# réconcilie dans les deux minutes. Le workflow n'a donc AUCUN accès au
+# cluster : le dépôt reste la seule source de vérité, et une panne de la CI ne
+# peut pas laisser le cluster dans un état que git ignore.
+
+name: Build and deploy
+
+on:
+  push:
+    branches: [dev, prod]
+    paths-ignore:
+      # Le commit de tag que ce workflow pousse lui-même ne touche que
+      # l'overlay : l'exclure est ce qui empêche la boucle infinie.
+      - "infra/k8s/overlays/**"
+      - "livrables/**"
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environnement à déployer
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+# Un déploiement en cours n'est jamais interrompu : les pushes suivants
+# attendent leur tour plutôt que d'annuler celui qui écrit déjà dans le
+# registre et sur la branche.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # obtenir le jeton OIDC présenté à AWS
+  contents: write # pousser le commit de tag
+
+jobs:
+  checks:
+    name: Barrières de qualité
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      # Le GeoJSON a déjà régressé à 2,6 Mo une fois sans que personne ne le
+      # voie : ce budget est là pour que cela se voie.
+      - name: Budget d'actifs statiques
+        run: npm run perf:budget
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `pip check` prouve que les versions épinglées résolvent ENSEMBLE, ce
+      # qu'une simple compilation ne dit pas — c'est le contrôle qui manquait
+      # quand fastapi a dû monter pour laisser passer un starlette corrigé.
+      - name: Dépendances et tests backend
+        working-directory: backend
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -r requirements.txt pytest
+          python -m pip check
+          python -m pytest tests -q
+
+  deploy:
+    name: Images et déploiement
+    needs: checks
+    runs-on: ubuntu-latest
+    env:
+      ENV_NAME: ${{ github.event.inputs.environment || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Résoudre l'environnement
+        id: env
+        run: |
+          set -euo pipefail
+          case "$ENV_NAME" in
+            dev)  region=eu-west-3;    role=role-diav1-cicd-dev ;;
+            prod) region=eu-central-1; role=role-diav1-cicd-prod ;;
+            *) echo "Environnement inconnu : $ENV_NAME" >&2; exit 1 ;;
+          esac
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "role=arn:aws:iam::${{ vars.AWS_ACCOUNT_ID || '431000516997' }}:role/$role" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.role }}
+          aws-region: ${{ steps.env.outputs.region }}
+
+      # Les valeurs de build viennent d'AWS, pas du dépôt : Terraform les tient
+      # à jour, donc elles ne peuvent pas diverger de l'environnement réel.
+      - name: Lire la configuration de build
+        id: cfg
+        run: |
+          set -euo pipefail
+          json=$(aws ssm get-parameter --name "/diav1-${ENV_NAME}/ci/build-config" --query 'Parameter.Value' --output text)
+          for k in web_repo ai_repo supabase_url supabase_anon_key vapid_public_key; do
+            echo "$k=$(echo "$json" | python -c "import sys,json;print(json.load(sys.stdin)['$k'])")" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construire les deux images
+        run: |
+          set -euo pipefail
+          build() {
+            docker build \
+              --file "$2" \
+              --build-arg "NEXT_PUBLIC_SUPABASE_URL=${{ steps.cfg.outputs.supabase_url }}" \
+              --build-arg "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ steps.cfg.outputs.supabase_anon_key }}" \
+              --build-arg "NEXT_PUBLIC_VAPID_PUBLIC_KEY=${{ steps.cfg.outputs.vapid_public_key }}" \
+              --build-arg "BUILD_ID=${{ steps.env.outputs.tag }}" \
+              --tag "$1:${{ steps.env.outputs.tag }}" \
+              --tag "$1:latest" \
+              .
+          }
+          build "${{ steps.cfg.outputs.web_repo }}" Dockerfile
+          build "${{ steps.cfg.outputs.ai_repo }}"  backend/Dockerfile
+
+      # Le scan porte sur l'image LOCALE : scanner apres la poussee serait trop
+      # tard, la version vulnerable serait deja disponible.
+      #
+      # Trivy est installe directement plutot que par une action tierce : la
+      # version vit alors en un seul endroit, et l'on ne depend pas d'un tag
+      # d'action qui peut ne pas exister — c'est exactement ce qui a fait
+      # echouer ce job au premier essai.
+      - name: Scan Trivy
+        env:
+          TRIVY_VERSION: "0.74.0"
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"             | sudo tar -xz -C /usr/local/bin trivy
+          for repo in "${{ steps.cfg.outputs.web_repo }}" "${{ steps.cfg.outputs.ai_repo }}"; do
+            trivy image --format table --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$repo:${{ steps.env.outputs.tag }}"
+          done
+
+      - name: Pousser dans ECR
+        run: |
+          set -euo pipefail
+          for repo in "${{ steps.cfg.outputs.web_repo }}" "${{ steps.cfg.outputs.ai_repo }}"; do
+            docker push "$repo:${{ steps.env.outputs.tag }}"
+            # :latest sert d'amorce : les overlays sortent d'usine avec
+            # newTag: latest, donc une première réconciliation a une image à
+            # tirer avant qu'un déploiement n'ait bougé le tag.
+            docker push "$repo:latest"
+          done
+
+      - name: Déplacer le tag et pousser
+        env:
+          KUSTOMIZE_VERSION: "v5.8.2"
+          KUSTOMIZE_SHA256: "06af0a202c2b831207d0173f9c9cdb1b30abceca0747cb3fbb72792d26055c95"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          echo "${KUSTOMIZE_SHA256}  kustomize.tar.gz" | sha256sum -c -
+          sudo tar -xzf kustomize.tar.gz -C /usr/local/bin kustomize
+          rm kustomize.tar.gz
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          overlay="infra/k8s/overlays/${ENV_NAME}/kustomization.yaml"
+          tag="${{ steps.env.outputs.tag }}"
+
+          # `kustomize edit set image NOM:TAG` écrit newTag et SUPPRIME
+          # newName, qui porte ${web_image_repo} — la substitution que Flux
+          # résout depuis Terraform. Sans lui, les images se résolvent vers
+          # Docker Hub et les pods cessent de démarrer ; ce dépôt a déjà été
+          # réparé à la main une fois pour cette raison exacte. On relit donc
+          # newName et on le repasse explicitement.
+          set_tags() {
+            (
+              cd "$(dirname "$overlay")"
+              for img in web ai; do
+                name="diav1-${img}"
+                newname=$(awk -v n="$name" '
+                  $1=="-" && $2=="name:" && $3==n {found=1; next}
+                  found && $1=="newName:" {print $2; exit}
+                  found && $1=="-" {exit}
+                ' kustomization.yaml)
+                [ -n "$newname" ] || { echo "newName manquant pour ${name}" >&2; exit 1; }
+                kustomize edit set image "${name}=${newname}:${tag}"
+              done
+
+              # Garde-fou : ne jamais pousser un overlay qui a perdu sa référence de
+              # registre, quoi qu'ait fait kustomize.
+              for img in web ai; do
+                grep -q "newName: \${${img}_image_repo}" kustomization.yaml || {
+                  echo "newName pour diav1-${img} n'a pas survecu a l'edition" >&2
+                  exit 1
+                }
+              done
+            )
+          }
+
+          # L'édition se fait sur la tête ACTUELLE de la branche, pas sur le
+          # commit construit : le commit de tag du run précédent (ou tout autre
+          # push arrivé pendant le build) y est déjà, donc aucun conflit de
+          # rebase possible sur les lignes newTag. Si un push s'intercale entre
+          # le fetch et le push, on recommence depuis la nouvelle tête.
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet origin "${ENV_NAME}"
+            git reset --quiet --hard "origin/${ENV_NAME}"
+            set_tags
+
+            if git diff --quiet; then
+              echo "Le tag etait deja a jour : rien a deployer."
+              exit 0
+            fi
+
+            git add "$overlay"
+            git commit --quiet -m "deploy(${ENV_NAME}): image ${tag}"
+            if git push origin "HEAD:${ENV_NAME}"; then
+              echo "Tag ${tag} pousse ; Flux reconcilie dans les deux minutes."
+              exit 0
+            fi
+            echo "Push refuse (tentative ${attempt}) : la branche a bouge, nouvel essai."
+            sleep $((attempt * 3))
+          done
+          echo "Impossible de pousser le tag apres 5 tentatives." >&2
+          exit 1
+
+      - name: Résumé
+        if: always()
+        run: |
+          {
+            echo "### Deploiement ${ENV_NAME}"
+            echo ""
+            echo "| | |"
+            echo "|--|--|"
+            echo "| Tag | ${{ steps.env.outputs.tag }} |"
+            echo "| Region | ${{ steps.env.outputs.region }} |"
+            echo "| Registre | ${{ steps.cfg.outputs.web_repo }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── Promotion vers prod ───
+  #
+  # Ce pipeline est branche = environnement, SANS promotion automatique : un
+  # correctif pousse sur `dev` ne rejoint jamais `prod` tout seul. Le 14/09/2026,
+  # c'est ce qui a laisse prod cassee et en retard pendant qu'un fix `npm ci`
+  # remettait dev au vert, sans que personne ne le voie.
+  #
+  # Ce job ferme ce trou SANS retirer le controle humain : apres un deploiement
+  # dev reussi, il ouvre (ou laisse en place) une PR `dev -> prod`. La promotion
+  # devient un clic, jamais oubliee ; c'est le merge HUMAIN de cette PR qui
+  # pousse sur prod et declenche le deploiement prod. Rien ne part en prod sans
+  # une decision explicite.
+  promote-pr:
+    name: PR de promotion dev->prod
+    needs: deploy
+    # Uniquement apres un deploiement dev reussi ; jamais depuis prod.
+    if: needs.deploy.result == 'success' && (github.event.inputs.environment || github.ref_name) == 'dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # ouvrir la PR de promotion
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ouvrir ou mettre à jour la PR dev->prod
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin dev prod --quiet
+
+          # Rien a promouvoir si prod contient deja la tete de dev.
+          if git merge-base --is-ancestor origin/dev origin/prod; then
+            echo "prod est deja a jour avec dev : aucune PR necessaire."
+            exit 0
+          fi
+
+          # Une PR dev->prod deja ouverte ? On la laisse, elle suit dev toute seule.
+          existing=$(gh pr list --base prod --head dev --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing deja ouverte pour dev->prod ; laissee en place."
+            exit 0
+          fi
+
+          body=$'Promotion automatique ouverte apres un deploiement **dev** reussi.\n\nMerger cette PR pousse sur `prod` et declenche le deploiement prod (eu-central-1), Flux reconcilie sous deux minutes. Rien ne part en prod sans ce merge.'
+          gh pr create --base prod --head dev \
+            --title "promote(dev->prod): $(git rev-parse --short=7 origin/dev)" \
+            --body "$body"
+
+  # ─── Alerte d'echec ───
+  #
+  # Un run rate ne produit aucun commit `deploy` et, sans alerte, passe inapercu
+  # — c'est exactement ce qui a laisse prod cassee en silence le 14/09/2026. Ce
+  # job ouvre (ou complete) une issue GitHub des qu'une barriere echoue, pour que
+  # l'echec soit visible. GitHub e-maile deja les abonnes de l'issue.
+  notify-failure:
+    name: Alerte d'echec CI
+    needs: [checks, deploy, promote-pr]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # ouvrir/commenter l'issue d'alerte
+    steps:
+      - name: Ouvrir ou compléter l'issue d'échec
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.inputs.environment || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          title="CI en echec sur \`${BRANCH}\`"
+          note="Run en echec : ${RUN_URL} (commit ${SHA:0:7}, $(date -u +%FT%TZ)). Le deploiement ${BRANCH} n'a PAS abouti — l'environnement reste sur sa version precedente."
+
+          # Une seule issue ouverte par branche : on complete plutot que d'en empiler.
+          num=$(gh issue list --repo "$REPO" --state open --label ci-failure \
+                 --json number,title --jq ".[] | select(.title==\"${title}\") | .number" | head -1)
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --repo "$REPO" --body "$note"
+            echo "Issue #${num} completee."
+          else
+            gh label create ci-failure --repo "$REPO" --color B60205 \
+              --description "Run CI en echec" 2>/dev/null || true
+            gh issue create --repo "$REPO" --title "$title" --label ci-failure --body "$note"
+          fi

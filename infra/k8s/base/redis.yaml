@@ -1,0 +1,136 @@
+# Redis, in-cluster.
+#
+# ElastiCache existe et fonctionne (module elasticache, `enable_managed_redis`),
+# mais il reste éteint par défaut : pour ce que ce cache contient réellement, un
+# service managé facturé au nœud n'est pas une dépense défendable :
+#
+#   · DHIS2 metadata and analytics results — re-fetchable from SNIS RDC
+#   · the agent's rate-limit counters — losing them widens a window, briefly
+#   · the server-side analysis handoff — a miss just recomputes
+#
+# Every entry is reconstructible, and the application's cache layer already
+# degrades to in-process memory when Redis is unreachable. So a single small
+# pod is the right shape here.
+#
+# What this deliberately is NOT: durable. There is no PersistentVolume, no
+# replica and no SLA. A restart empties the cache, which costs one slow request
+# per key. Set enable_managed_redis = true in Terraform when that stops being
+# acceptable.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: diav1
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two Redis pods would serve two different
+  # caches behind one Service, which is worse than a few seconds without one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: diav1
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args:
+            - "--maxmemory"
+            - "192mb"
+            # Entries carry their own TTL; evicting the least recently used key
+            # under pressure is correct — a lost entry is a miss, not an error.
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+            # No persistence: the data is a cache, and disabling the RDB dump
+            # avoids fork pauses and the disk it would need.
+            - "--save"
+            - ""
+            - "--appendonly"
+            - "no"
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # Slightly above maxmemory, to leave room for Redis' own overhead
+              # rather than have the kernel OOM-kill it at the ceiling.
+              memory: 256Mi
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: diav1
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+# Only the application workloads may open a connection. This is what makes it
+# acceptable to run Redis without a password: nothing else in the cluster can
+# reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: diav1
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: [web, ai, etl, db-migrate]
+      ports:
+        - protocol: TCP
+          port: 6379

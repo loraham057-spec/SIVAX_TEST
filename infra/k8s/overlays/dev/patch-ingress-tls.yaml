@@ -1,0 +1,35 @@
+# Nom public servi par l'ingress.
+#
+# CE QUI A DISPARU ICI, et pourquoi. Ce patch posait aussi un bloc `tls` et les
+# annotations cert-manager : l'ingress terminait lui-meme le TLS avec un
+# certificat Let's Encrypt. Le TLS s'arrete desormais au bord (ALB + certificat
+# ACM), et le garder ici serait activement nuisible — nginx repondrait 308 vers
+# HTTPS a des requetes que l'ALB lui envoie deja en clair, l'ALB rappellerait en
+# clair, et le navigateur verrait « trop de redirections » devant une
+# application parfaitement saine. C'est `use-forwarded-headers` cote controleur
+# qui ferme ce piege, et l'absence de bloc tls qui le rend impossible.
+#
+# Ce qui reste est le seul role encore utile de ce patch : porter le host de la
+# regle, pour que l'ingress ne serve ce backend que sous le nom public.
+#
+# `spec.rules` est une liste sans cle de fusion : un patch de fusion strategique
+# la remplace entierement, la regle est donc reproduite ici en entier, avec le
+# host en plus. Les annotations, elles, sont une map et fusionnent — le controle
+# d'origine de la base est conserve tel quel.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: diav1
+spec:
+  rules:
+    - host: ${ingress_host}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  name: http

@@ -1,0 +1,88 @@
+# Émetteur ACME Let's Encrypt, résolveur HTTP-01.
+#
+# HTTP-01 plutôt que DNS-01 : la zone est chez Hostinger, hors d'AWS, donc
+# aucun accès programmatique à l'API DNS depuis le cluster. HTTP-01 n'a besoin
+# que de deux choses : le nom pointe sur les IP d'ingress, et le port 80 est
+# joignable depuis Internet (règle d'entrée du groupe de sécurité du cluster).
+# cert-manager crée un Ingress temporaire pour servir le jeton, puis le supprime.
+#
+# ⚠️ CE QUI A DISPARU EN VENANT D'AZURE, et pourquoi. Le cluster AKS portait une
+# réécriture CoreDNS (`coredns-custom`) qui faisait résoudre le nom public vers
+# le service d'ingress À L'INTÉRIEUR du cluster. Elle était indispensable :
+# avant d'appeler Let's Encrypt, cert-manager fait sa propre auto-vérification,
+# et Azure Load Balancer ne supporte pas le hairpin — un nœud ne peut pas
+# joindre l'IP frontale du load balancer derrière lequel il se trouve. Sans
+# réécriture, l'auto-vérification expirait et aucun certificat n'était émis.
+#
+# Sur AWS, la topologie règle le problème d'elle-même : les nœuds sont dans des
+# sous-réseaux privés et sortent par la NAT Gateway. Le paquet vers l'IP
+# élastique de l'ingress quitte donc le VPC, revient par la passerelle Internet,
+# et le NLB voit comme source l'adresse de la NAT — pas celle d'une cible
+# enregistrée. La restriction de hairpin d'AWS, qui ne vise que les connexions
+# venant d'une cible enregistrée, ne s'applique pas.
+#
+# Si une auto-vérification venait malgré tout à expirer, le correctif est une
+# réécriture équivalente dans le Corefile de CoreDNS — mais sur EKS le Corefile
+# appartient à l'add-on managé, donc cela suppose de passer par
+# `configuration_values` côté Terraform plutôt que par un ConfigMap posé à côté.
+#
+# Deux émetteurs volontairement : Let's Encrypt applique un quota serré sur
+# l'environnement de production (5 échecs par compte et par heure). On met au
+# point contre `letsencrypt-staging`, dont le certificat n'est pas approuvé mais
+# dont le quota est large, et on bascule sur `letsencrypt` une fois la chaîne
+# validée.
+#
+# Pas de champ `email` : il est facultatif côté cert-manager, et une valeur
+# vide n'est pas acceptée — le webhook rejette `email: null` avec « must be of
+# type string », ce qui faisait échouer tout le lot. Pour recevoir les avis
+# d'expiration de Let's Encrypt, ajouter `email: adresse@domaine` sous `acme`.
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+            # L'Ingress applicatif porte un bloc tls, donc ingress-nginx
+            # redirige tout le host en 308 vers HTTPS — y compris
+            # /.well-known/acme-challenge. L'auto-vérification de cert-manager
+            # suit alors vers un HTTPS qui présente encore le certificat de
+            # secours, et le défi n'aboutit jamais. L'Ingress temporaire du
+            # solveur doit donc être explicitement exempté.
+            ingressTemplate:
+              metadata:
+                annotations:
+                  nginx.ingress.kubernetes.io/ssl-redirect: "false"
+                  nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+            # L'Ingress applicatif porte un bloc tls, donc ingress-nginx
+            # redirige tout le host en 308 vers HTTPS — y compris
+            # /.well-known/acme-challenge. L'auto-vérification de cert-manager
+            # suit alors vers un HTTPS qui présente encore le certificat de
+            # secours, et le défi n'aboutit jamais. L'Ingress temporaire du
+            # solveur doit donc être explicitement exempté.
+            ingressTemplate:
+              metadata:
+                annotations:
+                  nginx.ingress.kubernetes.io/ssl-redirect: "false"
+                  nginx.ingress.kubernetes.io/force-ssl-redirect: "false"

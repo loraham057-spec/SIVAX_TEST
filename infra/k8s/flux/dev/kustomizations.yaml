@@ -1,0 +1,91 @@
+# Composants de plateforme, communs à tous les clusters et indépendants de
+# l'environnement : le contrôleur d'ingress et cert-manager. Réconciliés sur
+# leur propre chemin pour ne pas être emportés dans le namespace des overlays,
+# et sans lien de dépendance vers « apps » — les charges tournent que le bord
+# soit debout ou non, et les coupler laisserait un hoquet du contrôleur bloquer
+# un déploiement applicatif.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: platform
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 1m
+  timeout: 10m
+  path: ./infra/k8s/platform
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    # Nom de la release helm flux2-sync, pas « flux-system » : c'est le chart
+    # qui cree ce GitRepository et il le nomme d'apres la release. Une
+    # reference a un nom inexistant laisse la Kustomization en
+    # « Source artifact not found », indefiniment et sans autre erreur.
+    name: flux2-sync
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-vars
+      - kind: Secret
+        name: cluster-secrets
+        optional: true
+---
+# Les émetteurs ACME, après la plateforme : leurs types viennent des CRD que la
+# release cert-manager installe. `dependsOn` est ce qui rend l'ordre explicite
+# — sans lui, Flux valide les deux lots en parallèle et celui des émetteurs
+# échoue systématiquement au dry-run.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: platform-issuers
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 1m
+  timeout: 10m
+  path: ./infra/k8s/platform-issuers
+  prune: true
+  dependsOn:
+    - name: platform
+  sourceRef:
+    kind: GitRepository
+    # Nom de la release helm flux2-sync, pas « flux-system » : c'est le chart
+    # qui cree ce GitRepository et il le nomme d'apres la release. Une
+    # reference a un nom inexistant laisse la Kustomization en
+    # « Source artifact not found », indefiniment et sans autre erreur.
+    name: flux2-sync
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-vars
+      - kind: Secret
+        name: cluster-secrets
+        optional: true
+---
+# L'application. Retirer un manifeste du dépôt retire l'objet du cluster.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  interval: 2m
+  retryInterval: 1m
+  timeout: 15m
+  path: ./infra/k8s/overlays/dev
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    # Nom de la release helm flux2-sync, pas « flux-system » : c'est le chart
+    # qui cree ce GitRepository et il le nomme d'apres la release. Une
+    # reference a un nom inexistant laisse la Kustomization en
+    # « Source artifact not found », indefiniment et sans autre erreur.
+    name: flux2-sync
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-vars
+      - kind: Secret
+        name: cluster-secrets
+        optional: true

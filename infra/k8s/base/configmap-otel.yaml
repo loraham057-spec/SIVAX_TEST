@@ -1,0 +1,178 @@
+# Configuration of the OpenTelemetry Collector that runs as a SIDECAR in every
+# application pod.
+#
+# Why a sidecar and not only the node agent:
+#
+#   L'agent CloudWatch (Container Insights) tourne déjà en DaemonSet et
+#   collecte stdout et les métriques de nœud — une fois par nœud, à bas coût.
+#   Il ne voit en revanche rien à l'intérieur de l'application : ni les traces
+#   distribuées, ni les métriques métier. Cette version anglaise du même
+#   raisonnement suit.
+#
+#   Container Insights already runs a DaemonSet that collects stdout and node
+#   metrics — once per node, cheaply. It cannot, however, see inside the
+#   application: distributed traces spanning Next.js → FastAPI → LLM → DHIS2,
+#   or the custom metrics this platform actually needs (ETL freshness, LLM
+#   tokens and cost per conversation, DHIS2 call counts). Those are emitted by
+#   the application over OTLP to localhost, which only a co-located collector
+#   can receive.
+#
+#   Running it per pod rather than as a second DaemonSet buys two things that
+#   matter here: the collector shares the pod's lifecycle, so telemetry from a
+#   terminating replica is flushed before the pod disappears; and each
+#   application gets its own pipeline and resource attributes without a shared
+#   component becoming a single point of failure for observability.
+#
+#   The cost is real and worth stating: roughly 64–128 MiB of RAM per pod. At
+#   the replica counts this platform runs (single digits) that is a rounding
+#   error against the node sizes; it would not be at hundreds of pods.
+#
+# Pipeline : app --OTLP--> sidecar --> X-Ray (traces)
+#                                  --> CloudWatch Logs (journaux)
+#                                  --> CloudWatch EMF + point Prometheus
+#                                      (métriques ; le point est scrapé par
+#                                      l'agent CloudWatch, qui lit les
+#                                      annotations posées sur les Deployments)
+#
+# Les trois exportateurs AWS s'authentifient avec le rôle IRSA du pod — le même
+# que l'application. Ce sont les politiques `telemetry-write` attachées aux
+# rôles web/ai/jobs (module observability) qui les autorisent ; sans elles, le
+# sidecar démarre normalement et échoue silencieusement à l'export, ce qui est
+# le mode de panne à connaître ici.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-sidecar-config
+  namespace: diav1
+  annotations:
+    # This config is full of the collector's own ${env:VAR} references, which
+    # are resolved by the collector at runtime — not by Flux. Opt this resource
+    # out of Flux's post-build substitution so those tokens are left intact.
+    kustomize.toolkit.fluxcd.io/substitute: disabled
+data:
+  config.yaml: |
+    receivers:
+      # The application talks to its sidecar over the pod's loopback, so this
+      # traffic never leaves the pod and needs no authentication.
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 127.0.0.1:4317
+          http:
+            endpoint: 127.0.0.1:4318
+
+      # Scrapes the application's own /metrics endpoint when it exposes one.
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: application
+              scrape_interval: 30s
+              static_configs:
+                - targets: ["127.0.0.1:${env:APP_METRICS_PORT}"]
+              metric_relabel_configs:
+                # Drop Node.js/Python runtime internals: high cardinality, low
+                # decision value, and they are already covered by the node agent.
+                - source_labels: [__name__]
+                  regex: "(nodejs|python_gc)_.*"
+                  action: drop
+
+    processors:
+      # Bounds the collector's own memory so a telemetry spike cannot get the
+      # sidecar OOM-killed and take the application container's pod with it.
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      batch:
+        timeout: 10s
+        send_batch_size: 512
+
+      # Stamps every signal with the pod's identity, so a trace can be traced
+      # back to a specific replica.
+      resource:
+        attributes:
+          - key: service.name
+            value: ${env:OTEL_SERVICE_NAME}
+            action: upsert
+          - key: service.namespace
+            value: diav1
+            action: upsert
+          - key: deployment.environment
+            value: ${env:DEPLOY_ENV}
+            action: upsert
+          - key: k8s.pod.name
+            value: ${env:POD_NAME}
+            action: upsert
+          - key: k8s.node.name
+            value: ${env:NODE_NAME}
+            action: upsert
+          - key: service.version
+            value: ${env:BUILD_ID}
+            action: upsert
+
+      # Health probes fire every few seconds and would otherwise dominate the
+      # trace volume without ever being read.
+      filter/drop_health_checks:
+        error_mode: ignore
+        traces:
+          span:
+            - 'attributes["http.route"] == "/api/health"'
+            - 'attributes["http.route"] == "/api/ready"'
+
+    exporters:
+      # Traces. X-Ray échantillonne côté service ; le sampler est piloté par
+      # OTEL_TRACES_SAMPLER_ARG dans app-config.
+      awsxray:
+        region: ${env:AWS_REGION}
+        index_all_attributes: true
+
+      # Journaux applicatifs, dans le groupe de l'environnement. Un flux par
+      # pod : c'est ce qui permet de suivre une réplique précise, et c'est aussi
+      # ce que lit le filtre de métrique « ETL sync succeeded » (alarme de
+      # fraîcheur, module observability).
+      awscloudwatchlogs:
+        region: ${env:AWS_REGION}
+        log_group_name: ${env:LOG_GROUP_NAME}
+        log_stream_name: ${env:POD_NAME}
+
+      # Métriques au format EMF : CloudWatch les extrait des journaux, donc
+      # aucune API de métriques à appeler et pas de limite de cardinalité par
+      # requête.
+      awsemf:
+        region: ${env:AWS_REGION}
+        log_group_name: ${env:LOG_GROUP_NAME}
+        log_stream_name: ${env:POD_NAME}
+        namespace: diav1/${env:DEPLOY_ENV}
+        resource_to_telemetry_conversion:
+          enabled: true
+
+      # Exposé pour être scrapé depuis le pod.
+      prometheus:
+        endpoint: 0.0.0.0:9464
+        resource_to_telemetry_conversion:
+          enabled: true
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, filter/drop_health_checks, resource, batch]
+          exporters: [awsxray]
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [memory_limiter, resource, batch]
+          exporters: [prometheus, awsemf]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [awscloudwatchlogs]
+      telemetry:
+        logs:
+          level: warn

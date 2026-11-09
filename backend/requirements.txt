@@ -1,0 +1,17 @@
+fastapi==0.141.1
+starlette>=1.3.1
+uvicorn[standard]==0.30.0
+langgraph>=0.2.0
+langchain-openai>=1.0.0
+langchain-core>=0.3.0
+pydantic==2.9.0
+psycopg2-binary==2.9.9
+supabase==2.7.0
+python-dotenv==1.0.1
+httpx==0.27.0
+pyjwt==2.14.0
+apscheduler>=3.10.0
+redis>=5.0.0
+# Transitif via langgraph-checkpoint. Plancher explicite : GHSA-6v7p-g79w-8964,
+# lecture hors bornes en réutilisant un Unpacker.
+msgpack>=1.2.1

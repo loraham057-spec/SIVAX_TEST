@@ -1,0 +1,17 @@
+# Pins Terraform without depending on a marketplace extension — the Microsoft
+# DevLabs `TerraformInstaller@1` task would do the same thing, but every
+# extension is one more thing an organisation has to approve.
+
+parameters:
+  - name: version
+    type: string
+    default: "1.9.8"
+
+steps:
+  - script: |
+      set -euo pipefail
+      curl -fsSL -o /tmp/terraform.zip \
+        "https://releases.hashicorp.com/terraform/${{ parameters.version }}/terraform_${{ parameters.version }}_linux_amd64.zip"
+      sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
+      terraform version
+    displayName: "Install Terraform ${{ parameters.version }}"

@@ -1,0 +1,25 @@
+# Non-secret configuration for prod.
+# Les URL, la region et le groupe de journaux sont substitues par Flux depuis
+# Terraform au moment de la reconciliation (map `substitutions` du module stack,
+# infra/aws/modules/stack).
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: diav1
+data:
+  DEPLOY_ENV: "prod"
+  DHIS2_BASE_URL: "https://snisrdc.com"
+  DHIS2_USERNAME: "Berly_Lora"
+  DHIS2_ROOT_OU: "ymGeqzoPhN3"
+  OPENAI_MODEL: "gpt-6-luna"
+  OPENAI_MODEL_FAST: "gpt-4o-mini"
+  NEXT_PUBLIC_SITE_URL: "${site_url}"
+  NEXT_PUBLIC_SUPABASE_URL: "${supabase_url}"
+  NEXT_PUBLIC_ASSETS_URL: "${assets_url}"
+  AWS_REGION: "${aws_region}"
+  LOG_GROUP_NAME: "${log_group_name}"
+  # 20% sampling: enough to characterise latency distributions without paying
+  # to ingest every health-check-adjacent span at production volume.
+  OTEL_TRACES_SAMPLER_ARG: "0.2"

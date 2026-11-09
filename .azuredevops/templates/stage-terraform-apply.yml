@@ -1,0 +1,102 @@
+# Apply réutilisable pour un environnement. Appelé par pipelines/iac-apply.yml.
+#
+# `environment:` sur le job de déploiement est ce qui applique les règles de
+# protection : l'environnement Azure DevOps nommé `prod` porte un approbateur
+# obligatoire, donc le job s'arrête jusqu'à ce qu'un humain approuve. Cette
+# approbation est la seule chose entre un merge et un changement en production.
+#
+# Authentification : identifiants AWS portés en variables secrètes du variable
+# group (voir templates/steps-aws-login.yml pour la variante OIDC sans clés).
+# Terraform les lit dans l'environnement, exactement comme le backend S3 et la
+# table de verrous DynamoDB.
+
+parameters:
+  - name: environment
+    type: string
+  - name: terraformVersion
+    type: string
+    default: "1.9.8"
+
+stages:
+  - stage: apply_${{ parameters.environment }}
+    displayName: "Apply — ${{ parameters.environment }}"
+    jobs:
+      - deployment: apply
+        displayName: "terraform apply (${{ parameters.environment }})"
+        pool:
+          vmImage: ubuntu-latest
+        # Approbations, gates et historique de déploiement se rattachent à ceci.
+        environment: ${{ parameters.environment }}
+        variables:
+          # Porte AWS_*, ECR_*, EKS_CLUSTER, SUPABASE_*, VAPID_* et les clés
+          # d'API tierces de cet environnement. Les membres secrets devraient
+          # venir d'un coffre plutôt que d'être saisis dans le groupe.
+          - group: diav1-${{ parameters.environment }}-aws
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - template: steps-install-terraform.yml
+                  parameters:
+                    version: ${{ parameters.terraformVersion }}
+
+                - template: steps-aws-login.yml
+
+                - script: |
+                    set -euo pipefail
+                    terraform init -backend-config=backend.hcl -input=false
+                    terraform plan  -input=false -out=tfplan
+                    terraform apply -input=false -auto-approve tfplan
+                  displayName: Init, plan et apply
+                  workingDirectory: infra/aws/envs/${{ parameters.environment }}
+                  env:
+                    # Le backend S3 et le verrou DynamoDB s'authentifient par
+                    # l'environnement, comme le fournisseur.
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_REGION)
+                    # Valeurs secrètes tierces. Elles vont du variable group
+                    # directement dans Secrets Manager ; rien d'autre ne les
+                    # manipule. Azure Pipelines n'expose PAS une variable
+                    # secrète à un script automatiquement — cette liste est ce
+                    # qui les rend disponibles, et seulement ici.
+                    TF_VAR_openai_api_key: $(OPENAI_API_KEY)
+                    TF_VAR_dhis2_password: $(DHIS2_PASSWORD)
+                    TF_VAR_resend_api_key: $(RESEND_API_KEY)
+                    TF_VAR_elevenlabs_api_key: $(ELEVENLABS_API_KEY)
+                    TF_VAR_supabase_service_role_key: $(SUPABASE_SERVICE_ROLE_KEY)
+                    TF_VAR_vapid_private_key: $(VAPID_PRIVATE_KEY)
+                    TF_VAR_supabase_anon_key: $(SUPABASE_ANON_KEY)
+                    TF_VAR_supabase_url: $(SUPABASE_URL)
+                    TF_VAR_vapid_public_key: $(VAPID_PUBLIC_KEY)
+                    TF_VAR_gitops_https_token: $(GITHUB_TOKEN)
+
+                # L'IP de sortie est ce dont le ministère a besoin pour une
+                # entrée d'allow-list SNIS RDC, et elle se perd facilement de
+                # vue. On la remonte dans le résumé du run —
+                # `task.uploadsummary` est l'équivalent Azure DevOps de
+                # $GITHUB_STEP_SUMMARY.
+                - script: |
+                    set -euo pipefail
+                    out="$(Agent.TempDirectory)/summary.md"
+                    {
+                      echo "### ${{ parameters.environment }} applique"
+                      echo ""
+                      echo "| Sortie | Valeur |"
+                      echo "|--------|--------|"
+                      echo "| URL publique | $(terraform output -raw public_url 2>/dev/null || echo n/a) |"
+                      echo "| IP de sortie | $(terraform output -json egress_ips 2>/dev/null | tr -d '\n' || echo n/a) |"
+                      echo "| IP d'ingress | $(terraform output -json ingress_ips 2>/dev/null | tr -d '\n' || echo n/a) |"
+                      echo "| Registre | $(terraform output -raw registry_host 2>/dev/null || echo n/a) |"
+                      echo "| Cluster | $(terraform output -raw cluster_name 2>/dev/null || echo n/a) |"
+                    } > "$out"
+                    echo "##vso[task.uploadsummary]$out"
+                  displayName: Resume
+                  condition: succeeded()
+                  workingDirectory: infra/aws/envs/${{ parameters.environment }}
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                    AWS_DEFAULT_REGION: $(AWS_REGION)

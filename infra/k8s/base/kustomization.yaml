@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: diav1
+
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - secretproviderclass.yaml
+  - configmap-app.yaml
+  - configmap-otel.yaml
+  - web-deployment.yaml
+  - ai-deployment.yaml
+  - services.yaml
+  - redis.yaml
+  - ingress.yaml
+  - autoscaling.yaml
+  - networkpolicy.yaml
+  - etl-cronjob.yaml
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: diav1
+  app.kubernetes.io/managed-by: flux
+
+images:
+  - name: diav1-web
+    newTag: latest
+  - name: diav1-ai
+    newTag: latest

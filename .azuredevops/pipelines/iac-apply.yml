@@ -1,0 +1,57 @@
+# IaC — apply
+#
+# BRANCH = ENVIRONMENT, the same rule the application deployment follows.
+#
+#   push on `dev`   → terraform apply on infra/aws/envs/dev
+#   push on `prod`  → terraform apply on infra/aws/envs/prod
+#
+# There is deliberately no dev→prod chaining. Chaining meant a single push
+# applied to production a few minutes later, which is the wrong default for
+# infrastructure: promotion is merging `dev` into `prod`, an explicit act, and
+# the `prod` Azure DevOps environment's required approver is the gate on it.
+#
+# The environment is resolved at COMPILE time, which is what lets each stage
+# bind its own variable group — variable groups cannot be selected from a
+# runtime value. `environment: auto` (the default) means "read it off the
+# branch"; picking dev or prod explicitly is the manual-run path, the
+# equivalent of workflow_dispatch.
+
+parameters:
+  - name: environment
+    displayName: Environment to apply
+    type: string
+    default: auto
+    values: [auto, dev, prod]
+
+trigger:
+  # `batch: true` queues pushes that arrive during a run instead of starting a
+  # second apply alongside it — the closest thing to concurrency groups with
+  # cancel-in-progress:false. An apply in flight is never interrupted.
+  batch: true
+  branches:
+    include:
+      - dev
+      - prod
+  paths:
+    include:
+      - infra/aws
+      - .azuredevops/pipelines/iac-apply.yml
+      - .azuredevops/templates/stage-terraform-apply.yml
+    exclude:
+      - infra/k8s # Kubernetes manifests are reconciled by Flux, not Terraform
+
+pr: none # applies never run from a pull request; iac-plan.yml is the PR gate
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - ${{ if or(eq(parameters.environment, 'dev'), and(eq(parameters.environment, 'auto'), eq(variables['Build.SourceBranch'], 'refs/heads/dev'))) }}:
+      - template: ../templates/stage-terraform-apply.yml
+        parameters:
+          environment: dev
+
+  - ${{ if or(eq(parameters.environment, 'prod'), and(eq(parameters.environment, 'auto'), eq(variables['Build.SourceBranch'], 'refs/heads/prod'))) }}:
+      - template: ../templates/stage-terraform-apply.yml
+        parameters:
+          environment: prod

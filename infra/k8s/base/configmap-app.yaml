@@ -1,0 +1,42 @@
+# Configuration non secrète, partagée par toutes les charges de travail.
+#
+# Les valeurs sont posées par environnement par les overlays. Tout ce qui est
+# secret vit dans Secrets Manager et arrive par le pilote CSI — jamais ici.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: diav1
+data:
+  DEPLOY_ENV: "base"
+  BUILD_ID: "unset"
+
+  # ─── DHIS2 / SNIS RDC ───
+  DHIS2_BASE_URL: "https://snisrdc.com"
+  DHIS2_USERNAME: ""
+  DHIS2_ROOT_OU: "ymGeqzoPhN3"
+
+  # ─── Model routing ───
+  # The fast model serves the nodes whose output the user never reads
+  # (intent classification, clarification drafting, fact-check regeneration).
+  # gpt-4o-mini is ~5x faster and ~10x cheaper than gpt-6-luna for these
+  # short, well-specified tasks. The main model (gpt-6-luna) handles the
+  # planner and response generation where quality matters most.
+  OPENAI_MODEL: "gpt-6-luna"
+  OPENAI_MODEL_FAST: "gpt-4o-mini"
+
+  # ─── Public application configuration ───
+  NEXT_PUBLIC_SITE_URL: ""
+  NEXT_PUBLIC_SUPABASE_URL: ""
+  NEXT_PUBLIC_ASSETS_URL: ""
+
+  # ─── Télémétrie ───
+  # Consommées par l'application et par son sidecar. AWS_REGION et
+  # LOG_GROUP_NAME sont ce dont les exportateurs X-Ray, EMF et CloudWatch Logs
+  # ont besoin ; le sidecar les lit par `envFrom` sur ce même ConfigMap.
+  AWS_REGION: ""
+  LOG_GROUP_NAME: ""
+  OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
+  # 100% in dev; the overlays lower it where volume justifies the cost.
+  OTEL_TRACES_SAMPLER_ARG: "1.0"

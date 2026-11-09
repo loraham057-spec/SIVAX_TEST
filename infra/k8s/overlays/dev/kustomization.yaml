@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: diav1
+resources:
+- ../../base
+# Image tags are rewritten by the deploy workflow, which commits the change so
+# Flux reconciles it. That is what makes "deploy = git push" literal.
+# Le tag seul est déplacé, jamais le nom : `newName` porte
+# ${web_image_repo} / ${ai_image_repo}, que Flux substitue depuis Terraform —
+# l'URL complète du dépôt ECR de l'environnement. L'écraser par un littéral
+# casserait la substitution, et les images se résoudraient alors vers Docker Hub
+# au lieu du registre du compte.
+images:
+- name: diav1-ai
+  newName: ${ai_image_repo}
+  newTag: sha-be5e901
+- name: diav1-web
+  newName: ${web_image_repo}
+  newTag: sha-be5e901
+patches:
+- path: patch-config.yaml
+- path: patch-identity.yaml
+- path: patch-ingress-tls.yaml
+- path: patch-scale.yaml
+  target:
+    kind: ScaledObject

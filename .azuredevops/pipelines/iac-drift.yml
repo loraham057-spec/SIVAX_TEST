@@ -1,0 +1,134 @@
+# IaC — drift detection    
+#
+# Answers one of the acceptance criteria directly: "no resource is created,
+# modified or deleted outside Terraform". A daily plan with -detailed-exitcode
+# returns 2 when reality no longer matches the code; that opens an issue rather
+# than sitting silently in a log.
+#
+# One deviation from the GitHub version, deliberate: these are plain jobs, not
+# deployment jobs bound to the `prod` environment. In GitHub the environment was
+# only a way to reach the secrets, but it also drags in the required approver —
+# a scheduled drift check that waits for a human to click approve at 06:00 is a
+# drift check that never runs. The variable group supplies the same values with
+# no gate.
+
+parameters:
+  - name: environments
+    type: object
+    default: [dev, prod]
+  - name: terraformVersion
+    type: string
+    default: "1.9.8"
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: "0 6 * * *"
+    displayName: Daily drift check
+    branches:
+      include:
+        - main # the branch the schedule reads the pipeline from
+    always: true # run even when nothing was pushed — that is the whole point
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - ${{ each env in parameters.environments }}:
+      - job: drift_${{ env }}
+        displayName: "Drift — ${{ env }}"
+        variables:
+          - group: diav1-${{ env }}-aws
+        steps:
+          - checkout: self
+
+          - template: ../templates/steps-install-terraform.yml
+            parameters:
+              version: ${{ parameters.terraformVersion }}
+
+          - template: ../templates/steps-aws-login.yml
+
+          - script: |
+              set -euo pipefail
+              terraform init -backend-config=backend.hcl -input=false
+
+              set +e
+              terraform plan -detailed-exitcode -no-color -input=false -lock=false > drift.txt 2>&1
+              code=$?
+              set -e
+
+              # 0 = aucun changement, 1 = erreur, 2 = derive
+              echo "##vso[task.setvariable variable=exitcode;isOutput=true]${code}"
+              if [ "$code" = "1" ]; then
+                cat drift.txt
+                exit 1
+              fi
+              if [ "$code" = "2" ]; then
+                echo "Derive detectee sur ${{ env }}."
+              else
+                echo "Aucune derive sur ${{ env }}."
+              fi
+            name: drift
+            displayName: Detecter la derive
+            workingDirectory: infra/aws/envs/${{ env }}
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(AWS_REGION)
+              TF_VAR_supabase_anon_key: $(SUPABASE_ANON_KEY)
+              TF_VAR_supabase_url: $(SUPABASE_URL)
+              TF_VAR_vapid_public_key: $(VAPID_PUBLIC_KEY)
+              TF_VAR_gitops_https_token: $(GITHUB_TOKEN)
+              TF_VAR_openai_api_key: $(OPENAI_API_KEY)
+              TF_VAR_dhis2_password: $(DHIS2_PASSWORD)
+              TF_VAR_resend_api_key: $(RESEND_API_KEY)
+              TF_VAR_elevenlabs_api_key: $(ELEVENLABS_API_KEY)
+              TF_VAR_supabase_service_role_key: $(SUPABASE_SERVICE_ROLE_KEY)
+              TF_VAR_vapid_private_key: $(VAPID_PRIVATE_KEY)
+
+          # Same behaviour as the github-script step: one open issue per
+          # environment, commented on rather than duplicated.
+          - script: |
+              set -euo pipefail
+              repo="$(Build.Repository.Name)"
+              title="Drift detected on ${{ env }}"
+              plan_file="infra/aws/envs/${{ env }}/drift.txt"
+
+              head -c 55000 "$plan_file" > /tmp/drift-trunc.txt
+              [ "$(wc -c < "$plan_file")" -gt 55000 ] && echo '… truncated …' >> /tmp/drift-trunc.txt
+
+              {
+                printf 'AWS ne correspond plus au code Terraform for `%s`.\n\n' "${{ env }}"
+                printf 'Either the change was made outside Terraform and should be reverted, '
+                printf 'or it is legitimate and should be codified.\n\n'
+                printf '<details><summary>Plan</summary>\n\n```hcl\n'
+                cat /tmp/drift-trunc.txt
+                printf '\n```\n\n</details>\n'
+              } > /tmp/body.md
+
+              api="https://api.github.com/repos/${repo}"
+              auth="Authorization: Bearer ${GITHUB_TOKEN}"
+              accept="Accept: application/vnd.github+json"
+
+              number=$(curl -sS -H "$auth" -H "$accept" \
+                "${api}/issues?state=open&labels=drift" \
+                | jq -r --arg t "$title" '.[] | select(.title == $t) | .number' | head -n1)
+
+              if [ -n "$number" ]; then
+                jq -Rs '{body: .}' < /tmp/body.md > /tmp/payload.json
+                curl -sS -f -X POST -H "$auth" -H "$accept" \
+                  "${api}/issues/${number}/comments" -d @/tmp/payload.json > /dev/null
+                echo "Commented on issue #${number}."
+              else
+                jq -Rs --arg t "$title" \
+                  '{title: $t, body: ., labels: ["drift", "infrastructure"]}' \
+                  < /tmp/body.md > /tmp/payload.json
+                curl -sS -f -X POST -H "$auth" -H "$accept" \
+                  "${api}/issues" -d @/tmp/payload.json > /dev/null
+                echo "Opened a new drift issue."
+              fi
+            displayName: Open an issue on drift
+            condition: eq(variables['drift.exitcode'], '2')
+            env:
+              GITHUB_TOKEN: $(GITHUB_TOKEN)
